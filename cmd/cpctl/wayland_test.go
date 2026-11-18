@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +106,59 @@ func TestRunClipboardCommandRejectsOversizedOutput(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "output is larger than") {
 		t.Errorf("error = %v, want an output-limit error", err)
+	}
+}
+
+// TestRunClipboardCommandDetachedDoesNotWaitForForkedChild guards against the
+// wl-copy hang: the tool exits, but a forked child keeps its inherited stdio
+// open while it serves the clipboard. Wait must not follow that child.
+func TestRunClipboardCommandDetachedDoesNotWaitForForkedChild(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	start := time.Now()
+	err := runClipboardCommandDetached(context.Background(), 5*time.Second, nil,
+		"sh", "-c", "sleep 2 &")
+	if err != nil {
+		t.Fatalf("runClipboardCommandDetached: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("waited %v for a forked child, want an immediate return", elapsed)
+	}
+}
+
+func TestRunClipboardCommandDetachedReportsStderr(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	err := runClipboardCommandDetached(context.Background(), time.Second, nil,
+		"sh", "-c", "echo boom >&2; exit 1")
+	if err == nil {
+		t.Fatal("runClipboardCommandDetached accepted a failing command")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %v, want the command's stderr", err)
+	}
+}
+
+func TestWriteWaylandClipboardReturnsWhenCopyForks(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\nsleep 2 &\ncat >/dev/null\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "wl-copy"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake wl-copy: %v", err)
+	}
+	t.Setenv("WAYLAND_DISPLAY", "wayland-test")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	start := time.Now()
+	if err := writeWaylandClipboard(context.Background(), []byte("hello"), "text/plain"); err != nil {
+		t.Fatalf("writeWaylandClipboard: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("writeWaylandClipboard waited %v for the forked copy, want an immediate return", elapsed)
 	}
 }
 
