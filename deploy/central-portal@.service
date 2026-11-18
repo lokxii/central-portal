@@ -1,0 +1,30 @@
+[Unit]
+Description=Central Portal (shared clipboard and file)
+After=network-online.target zerotier-one.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install as central-portal@<your-user>.service.
+User=%i
+Group=%i
+WorkingDirectory=/opt/central-portal
+ExecStart=/opt/central-portal/bin/central-portal -data /var/lib/central-portal
+StateDirectory=central-portal
+StateDirectoryMode=0700
+Restart=always
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

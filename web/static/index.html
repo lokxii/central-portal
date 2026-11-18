@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0c10">
+<meta name="description" content="Share one clipboard and one file between your ZeroTier devices.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Portal">
+<title>Central Portal</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png">
+<link rel="stylesheet" href="/style.css">
+<script type="module" src="/app.js"></script>
+</head>
+<body>
+<header class="topbar">
+<h1>Central Portal</h1>
+<p class="conn">
+<span class="dot offline" id="conn-dot" aria-hidden="true"></span>
+<span id="conn-label">connecting</span>
+</p>
+</header>
+<main>
+<section class="card" aria-labelledby="clipboard-title">
+<div class="card-head">
+<h2 id="clipboard-title">Clipboard</h2>
+<span class="meta" id="clipboard-meta">empty</span>
+</div>
+<img class="clipboard-image" id="clipboard-image" alt="Shared clipboard image" decoding="async" hidden>
+<textarea id="clipboard" rows="6" aria-label="Shared clipboard" placeholder="Shared clipboard" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+<div class="actions">
+<button type="button" id="paste">Paste</button>
+<button type="button" id="copy">Copy</button>
+<button type="button" id="save" class="primary" disabled>Save</button>
+</div>
+</section>
+<section class="card" aria-labelledby="file-title">
+<div class="card-head">
+<h2 id="file-title">File</h2>
+<span class="meta" id="file-meta">empty</span>
+</div>
+<p class="file-name" id="file-name" hidden>empty</p>
+<div class="progress-wrap" id="progress-wrap" hidden>
+<progress id="upload-progress" max="100" value="0" aria-label="Upload progress"></progress>
+<span id="upload-percent">0%</span>
+</div>
+<div class="actions">
+<button type="button" id="upload">Upload</button>
+<button type="button" id="download" disabled>Download</button>
+</div>
+<input id="file-input" type="file" hidden>
+</section>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

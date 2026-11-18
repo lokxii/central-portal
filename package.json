@@ -1,0 +1,11 @@
+{
+  "name": "central-portal-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p jsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}
