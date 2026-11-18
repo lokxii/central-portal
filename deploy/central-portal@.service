@@ -1,7 +1,8 @@
 [Unit]
 Description=Central Portal (shared clipboard and file)
+Documentation=file:///opt/central-portal/README.md
 After=network-online.target zerotier-one.service
-Wants=network-online.target
+Wants=network-online.target zerotier-one.service
 
 [Service]
 Type=simple
@@ -9,6 +10,10 @@ Type=simple
 User=%i
 Group=%i
 WorkingDirectory=/opt/central-portal
+# Wait (up to 60s) for a ZeroTier IPv4 address so the default "auto" listen
+# addresses and the server certificate include it. The server falls back to
+# loopback if it never appears, so a timeout is only a warning.
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 60 ]; do if ip -4 -o addr show 2>/dev/null | grep -Eq "[[:space:]]zt[^[:space:]]*[[:space:]]+inet "; then exit 0; fi; i=$((i + 1)); sleep 1; done; echo "central-portal: no ZeroTier IPv4 address after 60s; HTTPS will bind loopback (use -addr :8443 to override)" >&2'
 ExecStart=/opt/central-portal/bin/central-portal -data /var/lib/central-portal
 StateDirectory=central-portal
 StateDirectoryMode=0700
@@ -24,7 +29,8 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK is required for net.Interfaces() to see the ZeroTier interface.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

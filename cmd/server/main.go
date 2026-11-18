@@ -55,11 +55,12 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
-	addr := flag.String("addr", ":8443", "HTTPS listen address")
-	httpAddr := flag.String("http-addr", ":8080", "bootstrap HTTP listen address (empty disables)")
+	addr := flag.String("addr", "auto", `HTTPS listen address; "auto" binds the ZeroTier IPv4 address (else loopback), ":8443" or "0.0.0.0:8443" binds all interfaces`)
+	httpAddr := flag.String("http-addr", "auto", `bootstrap HTTP listen address; "auto" works like -addr, empty disables`)
 	dataDir := flag.String("data", "data", "directory for registries and certificates")
 	maxClipboard := flag.Int64("max-clipboard-bytes", 16777216, "clipboard upload limit in bytes")
 	maxFile := flag.Int64("max-file-bytes", 1073741824, "file upload limit in bytes")
+	rotateCA := flag.Bool("rotate-ca", false, "discard the existing CA and server certificate, then create new ones")
 	flag.Parse()
 
 	if *maxClipboard <= 0 || *maxFile <= 0 {
@@ -70,6 +71,17 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	certDir := filepath.Join(*dataDir, "certs")
+	if *rotateCA {
+		if err := certs.Reset(certDir); err != nil {
+			return fmt.Errorf("reset certificates: %w", err)
+		}
+	}
+	ztIP := zerotierIPv4()
+	httpsListen, httpsLoopback := server.ResolveListenAddr(*addr, ztIP, "8443")
+	if httpsLoopback {
+		logger.Warn("no ZeroTier IPv4 address found; binding HTTPS to loopback only",
+			"addr", httpsListen, "hint", "pass -addr :8443 to bind all interfaces")
+	}
 	hosts := localHosts()
 	cert, err := certs.Ensure(certDir, hosts)
 	if err != nil {
@@ -100,45 +112,46 @@ func run(logger *slog.Logger) error {
 		},
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
-		// No WriteTimeout: file downloads may take a long time.
+		// No total ReadTimeout/WriteTimeout: the handler sets per-operation
+		// idle deadlines, so large transfers may run as long as they progress.
 	}
-	httpsLn, err := net.Listen("tcp", *addr)
+	httpsLn, err := net.Listen("tcp", httpsListen)
 	if err != nil {
-		return fmt.Errorf("listen https %s: %w", *addr, err)
+		return fmt.Errorf("listen https %s: %w", httpsListen, err)
 	}
 	defer httpsLn.Close()
 
-	httpsPort := portOf(*addr, "8443")
+	httpsPort := portOf(httpsListen, "8443")
+	advertised := advertisedFor(httpsListen, hosts)
+	httpsURL := "https://" + net.JoinHostPort(advertised, httpsPort)
+
 	var httpSrv *http.Server
 	var httpLn net.Listener
+	httpPort := "8080"
 	if *httpAddr != "" {
-		httpLn, err = net.Listen("tcp", *httpAddr)
+		httpListenAddr, httpLoopback := server.ResolveListenAddr(*httpAddr, ztIP, httpPort)
+		if httpLoopback {
+			logger.Warn("no ZeroTier IPv4 address found; binding bootstrap HTTP to loopback only",
+				"addr", httpListenAddr, "hint", "pass -http-addr :8080 to bind all interfaces")
+		}
+		httpLn, err = net.Listen("tcp", httpListenAddr)
 		if err != nil {
-			return fmt.Errorf("listen http %s: %w", *httpAddr, err)
+			return fmt.Errorf("listen http %s: %w", httpListenAddr, err)
 		}
 		defer httpLn.Close()
+		httpPort = portOf(httpListenAddr, httpPort)
 		httpSrv = &http.Server{
-			Handler:           bootstrapHandler(certs.CAPath(certDir), httpsPort, logger),
+			Handler:           bootstrapHandler(certs.CAPath(certDir), advertised, httpPort, logger),
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       time.Minute,
 		}
 	}
 
-	advertised := ""
-	if host, _, err := net.SplitHostPort(*addr); err == nil {
-		if ip := net.ParseIP(host); host != "" && (ip == nil || !ip.IsUnspecified()) {
-			advertised = host
-		}
-	}
-	if advertised == "" {
-		advertised = advertisedHost(hosts)
-	}
-	httpsURL := "https://" + net.JoinHostPort(advertised, httpsPort)
 	httpListen := "disabled"
 	httpURL := "disabled"
 	if httpSrv != nil {
 		httpListen = httpLn.Addr().String()
-		httpURL = "http://" + net.JoinHostPort(advertised, portOf(*httpAddr, "8080"))
+		httpURL = "http://" + net.JoinHostPort(advertised, httpPort)
 	}
 	logger.Info("central portal started",
 		"https_listen", httpsLn.Addr().String(),
@@ -195,8 +208,14 @@ func shutdownServers(servers ...*http.Server) {
 }
 
 // bootstrapHandler serves the CA certificate and a tiny onboarding page. Every
-// other path is a 404 and nothing redirects to HTTPS.
-func bootstrapHandler(caPath, httpsPort string, logger *slog.Logger) http.Handler {
+// other path is a 404 and nothing redirects to HTTPS. The onboarding link uses
+// the advertised host resolved at startup, never the request Host header.
+func bootstrapHandler(caPath, advertisedHost, httpsPort string, logger *slog.Logger) http.Handler {
+	if advertisedHost == "" {
+		advertisedHost = "localhost"
+	}
+	onboardingURL := html.EscapeString("https://" + net.JoinHostPort(advertisedHost, httpsPort))
+	const bootstrapCSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ca.crt", func(w http.ResponseWriter, r *http.Request) {
 		data, err := os.ReadFile(caPath)
@@ -207,24 +226,26 @@ func bootstrapHandler(caPath, httpsPort string, logger *slog.Logger) http.Handle
 		}
 		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.Write(data)
 	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		if host == "" {
-			host = "localhost"
-		}
-		url := html.EscapeString("https://" + net.JoinHostPort(host, httpsPort))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		fmt.Fprintf(w, onboardingHTML, url, url)
+		w.Header().Set("Content-Security-Policy", bootstrapCSP)
+		fmt.Fprintf(w, onboardingHTML, onboardingURL, onboardingURL)
 	})
-	return mux
+	// Router-generated 404/405 responses need the same headers as the routes.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", bootstrapCSP)
+		w.Header().Set("Cache-Control", "no-store")
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // localHosts lists the names and addresses the server certificate must cover.
@@ -269,25 +290,46 @@ func localHosts() []string {
 	return hosts
 }
 
+// advertisedFor picks the host to advertise for a concrete listen address: an
+// explicit host wins, otherwise fall back to the ZeroTier/LAN address.
+func advertisedFor(listen string, hosts []string) string {
+	if host, _, err := net.SplitHostPort(listen); err == nil {
+		if ip := net.ParseIP(host); host != "" && (ip == nil || !ip.IsUnspecified()) {
+			return host
+		}
+	}
+	return advertisedHost(hosts)
+}
+
+// zerotierIPv4 returns the first IPv4 address of a ZeroTier interface, or "".
+func zerotierIPv4() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		if !strings.HasPrefix(iface.Name, "zt") {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() {
+				return ipNet.IP.String()
+			}
+		}
+	}
+	return ""
+}
+
 // advertisedHost picks the address to advertise: a ZeroTier IPv4 address when
 // the tunnel is up, otherwise the first non-loopback address.
 func advertisedHost(hosts []string) string {
-	interfaces, err := net.Interfaces()
-	if err == nil {
-		for _, iface := range interfaces {
-			if !strings.HasPrefix(iface.Name, "zt") {
-				continue
-			}
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
-					return ipNet.IP.String()
-				}
-			}
-		}
+	if ip := zerotierIPv4(); ip != "" {
+		return ip
 	}
 	for _, host := range hosts {
 		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {

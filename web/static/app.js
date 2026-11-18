@@ -10,6 +10,8 @@
 
 const POLL_MS = 10000;
 const TOAST_MS = 2500;
+const FETCH_TIMEOUT_MS = 8000;
+const MAX_IMAGE_PIXELS = 40000000;
 /** @type {string[]} */
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
@@ -21,6 +23,22 @@ function byId(id) {
   const node = document.getElementById(id);
   if (!node) throw new Error(`Missing element #${id}`);
   return node;
+}
+
+/**
+ * Fetch with a bounded wait so a stalled request cannot leave controls disabled.
+ * @param {RequestInfo | URL} input
+ * @param {RequestInit} [init]
+ * @returns {Promise<Response>}
+ */
+function fetchWithTimeout(input, init = {}) {
+  const signals = /** @type {typeof AbortSignal & { timeout?: (ms: number) => AbortSignal }} */ (AbortSignal);
+  if (typeof signals.timeout === "function") {
+    return fetch(input, { ...init, signal: signals.timeout(FETCH_TIMEOUT_MS) });
+  }
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => window.clearTimeout(timer));
 }
 
 const clipboardBox = /** @type {HTMLTextAreaElement} */ (byId("clipboard"));
@@ -98,8 +116,8 @@ function formatWhen(iso) {
  * @param {string} message
  */
 function toast(message) {
-  toastEl.textContent = message;
   toastEl.hidden = false;
+  toastEl.textContent = message;
   toastEl.classList.remove("is-visible");
   void toastEl.offsetWidth;
   toastEl.classList.add("is-visible");
@@ -222,10 +240,15 @@ async function syncClipboard(entry) {
   }
   clipboardSyncing = true;
   try {
-    const response = await fetch("/api/clipboard", { cache: "no-store" });
+    const response = await fetchWithTimeout("/api/clipboard", { cache: "no-store" });
     if (response.status === 404) return;
     if (!response.ok) {
       toast(await errorText(response));
+      return;
+    }
+    if (!(response.headers.get("Content-Type") || "").startsWith("text/plain")) {
+      // The registry flipped to an image while we were syncing text.
+      void refresh();
       return;
     }
     const text = await response.text();
@@ -245,7 +268,7 @@ async function syncClipboard(entry) {
  */
 async function loadRegistryClipboard() {
   try {
-    const statusResponse = await fetch("/api/status", { cache: "no-store" });
+    const statusResponse = await fetchWithTimeout("/api/status", { cache: "no-store" });
     if (!statusResponse.ok) {
       toast(await errorText(statusResponse));
       return;
@@ -264,7 +287,7 @@ async function loadRegistryClipboard() {
       return;
     }
 
-    const body = await fetch("/api/clipboard", { cache: "no-store" });
+    const body = await fetchWithTimeout("/api/clipboard", { cache: "no-store" });
     if (!body.ok) {
       toast(await errorText(body));
       return;
@@ -300,14 +323,16 @@ function applyStatus(next) {
   const entry = next.clipboard;
   const nextMode = entryMode(entry);
   const switched = nextMode !== observedMode;
+  const canReplaceDraft = !clipboardDirty && document.activeElement !== clipboardBox;
 
   portalStatus = next;
   renderFile(next.file);
 
-  if (switched) {
+  // Never discard an unsaved draft, focused text, or text typed before the
+  // first /api/status response lands.
+  if (switched && canReplaceDraft) {
     observedMode = nextMode;
     clipboardMode = nextMode;
-    clipboardDirty = false;
     syncedClipboardAt = null;
     clipboardBox.value = "";
   }
@@ -315,7 +340,7 @@ function applyStatus(next) {
   renderClipboard(entry);
 
   if (!entry) {
-    if (clipboardMode === "text" && !clipboardDirty && document.activeElement !== clipboardBox) {
+    if (clipboardMode === "text" && canReplaceDraft) {
       clipboardBox.value = "";
     }
     return;
@@ -329,7 +354,7 @@ async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const response = await fetch("/api/status", { cache: "no-store" });
+    const response = await fetchWithTimeout("/api/status", { cache: "no-store" });
     setConnected(true);
     if (!response.ok) {
       toast(await errorText(response));
@@ -343,6 +368,43 @@ async function refresh() {
   }
 }
 
+/**
+ * PUT the clipboard body and adopt the returned entry on success.
+ * @param {BodyInit} body
+ * @param {string} contentType
+ * @param {{ draft?: string }} [options] Text draft to keep when it still matches.
+ * @returns {Promise<boolean>} false when the server rejected the update.
+ */
+async function putClipboard(body, contentType, options = {}) {
+  const response = await fetchWithTimeout("/api/clipboard", {
+    method: "PUT",
+    headers: { "Content-Type": contentType },
+    body,
+    cache: "no-store",
+  });
+  setConnected(true);
+  if (!response.ok) {
+    toast(await errorText(response));
+    return false;
+  }
+  const entry = /** @type {Entry | null} */ (await response.json().catch(() => null));
+  if (entry) {
+    portalStatus.clipboard = entry;
+    clipboardMode = entryMode(entry);
+    observedMode = clipboardMode;
+    if (options.draft !== undefined) {
+      syncedClipboardAt = entry.updatedAt;
+      if (clipboardBox.value === options.draft) clipboardDirty = false;
+    } else {
+      syncedClipboardAt = clipboardMode === "text" ? null : entry.updatedAt;
+      clipboardDirty = false;
+      clipboardBox.value = "";
+    }
+    renderClipboard(entry);
+  }
+  return true;
+}
+
 async function saveClipboard() {
   const draft = clipboardBox.value;
   if (draft === "") {
@@ -353,26 +415,8 @@ async function saveClipboard() {
   saving = true;
   updateClipboardControls();
   try {
-    const response = await fetch("/api/clipboard", {
-      method: "PUT",
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-      body: draft,
-      cache: "no-store",
-    });
-    setConnected(true);
-    if (!response.ok) {
-      toast(await errorText(response));
-      return;
-    }
-    const entry = /** @type {Entry | null} */ (await response.json().catch(() => null));
-    if (entry) {
-      portalStatus.clipboard = entry;
-      syncedClipboardAt = entry.updatedAt;
-      clipboardMode = entryMode(entry);
-      observedMode = clipboardMode;
-      if (clipboardBox.value === draft) clipboardDirty = false;
-      renderClipboard(entry);
-    }
+    const saved = await putClipboard(draft, "text/plain; charset=utf-8", { draft });
+    if (!saved) return;
     toast("Clipboard saved");
     void refresh();
   } catch {
@@ -409,27 +453,8 @@ async function shareImage(blob, type) {
   sharing = true;
   updateClipboardControls();
   try {
-    const response = await fetch("/api/clipboard", {
-      method: "PUT",
-      headers: { "Content-Type": type },
-      body: blob,
-      cache: "no-store",
-    });
-    setConnected(true);
-    if (!response.ok) {
-      toast(await errorText(response));
-      return;
-    }
-    const entry = /** @type {Entry | null} */ (await response.json().catch(() => null));
-    if (entry) {
-      portalStatus.clipboard = entry;
-      clipboardMode = entryMode(entry);
-      observedMode = clipboardMode;
-      syncedClipboardAt = clipboardMode === "text" ? null : entry.updatedAt;
-      clipboardDirty = false;
-      clipboardBox.value = "";
-      renderClipboard(entry);
-    }
+    const shared = await putClipboard(blob, type);
+    if (!shared) return;
     toast("Image shared");
     void refresh();
   } catch {
@@ -497,14 +522,15 @@ async function pasteClipboard() {
   }
   try {
     const items = await clipboard.read();
-    const image = await findImage(items);
-    if (image) {
-      await shareImage(image.blob, image.type);
-      return;
-    }
+    // Rich payloads often carry both; prefer real text over an image.
     const text = await findText(items);
     if (text !== null && text !== "") {
       setDraft(text);
+      return;
+    }
+    const image = await findImage(items);
+    if (image) {
+      await shareImage(image.blob, image.type);
       return;
     }
   } catch {
@@ -533,6 +559,63 @@ function fallbackCopy() {
 
 /**
  * @param {Blob} blob
+ * @returns {Promise<ImageBitmap | null>}
+ */
+async function decodeBitmap(blob) {
+  if (typeof createImageBitmap !== "function") return null;
+  try {
+    return await createImageBitmap(blob);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {Blob} blob
+ * @returns {Promise<HTMLImageElement>}
+ */
+async function decodeImageElement(blob) {
+  // A data URL keeps the conversion inside the CSP's img-src 'self' data:.
+  /** @type {Promise<string>} */
+  const dataUrl = new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.onerror = () => reject(new Error("Could not read the image"));
+    reader.readAsDataURL(blob);
+  });
+  const image = new Image();
+  image.src = await dataUrl;
+  await image.decode();
+  return image;
+}
+
+/**
+ * @param {number} width
+ * @param {number} height
+ */
+function assertImageSize(width, height) {
+  if (width <= 0 || height <= 0) throw new Error("Image has no usable pixels.");
+  if (width * height > MAX_IMAGE_PIXELS) {
+    throw new Error(`Image is too large to copy (${(width * height / 1000000).toFixed(1)} megapixels).`);
+  }
+}
+
+/**
+ * @param {CanvasRenderingContext2D} context
+ * @param {HTMLCanvasElement} canvas
+ * @param {ImageBitmap | HTMLImageElement} source
+ * @param {number} width
+ * @param {number} height
+ */
+function drawToCanvas(context, canvas, source, width, height) {
+  assertImageSize(width, height);
+  canvas.width = width;
+  canvas.height = height;
+  context.drawImage(source, 0, 0);
+}
+
+/**
+ * @param {Blob} blob
  * @returns {Promise<Blob>}
  */
 async function toPng(blob) {
@@ -540,43 +623,21 @@ async function toPng(blob) {
   const context = canvas.getContext("2d");
   if (!context) throw new Error("Canvas is unavailable");
 
-  /** @type {ImageBitmap | null} */
-  let bitmap = null;
-  if (typeof createImageBitmap === "function") {
-    try {
-      bitmap = await createImageBitmap(blob);
-    } catch {
-      bitmap = null;
-    }
-  }
-
+  const bitmap = await decodeBitmap(blob);
   if (bitmap) {
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-    context.drawImage(bitmap, 0, 0);
-    bitmap.close();
+    try {
+      drawToCanvas(context, canvas, bitmap, bitmap.width, bitmap.height);
+    } finally {
+      bitmap.close();
+    }
   } else {
-    // A data URL keeps the conversion inside the CSP's img-src 'self' data:.
-    /** @type {Promise<string>} */
-    const dataUrl = new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
-      reader.onerror = () => reject(new Error("Could not read the image"));
-      reader.readAsDataURL(blob);
-    });
-    const image = new Image();
-    image.src = await dataUrl;
-    await image.decode();
-    canvas.width = image.naturalWidth;
-    canvas.height = image.naturalHeight;
-    context.drawImage(image, 0, 0);
+    const image = await decodeImageElement(blob);
+    drawToCanvas(context, canvas, image, image.naturalWidth, image.naturalHeight);
   }
 
-  /** @type {Promise<Blob>} */
-  const png = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     canvas.toBlob((result) => (result ? resolve(result) : reject(new Error("PNG conversion failed"))), "image/png");
   });
-  return png;
 }
 
 async function copyImage() {
@@ -585,19 +646,32 @@ async function copyImage() {
     toast("Image copy needs HTTPS and browser support.");
     return;
   }
-  try {
-    const response = await fetch("/api/clipboard", { cache: "no-store" });
-    setConnected(true);
-    if (!response.ok) {
-      toast(await errorText(response));
-      return;
+  /** @type {string} */
+  let failure = "";
+  // Safari drops the user gesture across awaits, so build the ClipboardItem
+  // synchronously and let its promise do the fetch/conversion.
+  const png = (async () => {
+    try {
+      const response = await fetchWithTimeout("/api/clipboard", { cache: "no-store" });
+      setConnected(true);
+      if (!response.ok) {
+        failure = await errorText(response);
+        throw new Error(failure);
+      }
+      const source = await response.blob();
+      return source.type === "image/png" ? source : await toPng(source);
+    } catch (error) {
+      if (!failure && error instanceof Error && error.name === "Error") failure = error.message;
+      throw error;
     }
-    const source = await response.blob();
-    const png = source.type === "image/png" ? source : await toPng(source);
-    await clipboard.write([new ClipboardItem({ "image/png": png })]);
+  })();
+  void png.catch(() => {});
+  try {
+    const item = new ClipboardItem({ "image/png": png });
+    await clipboard.write([item]);
     toast("Copied");
   } catch {
-    toast("Could not copy the image.");
+    toast(failure || "Could not copy the image.");
   }
 }
 
@@ -678,10 +752,16 @@ function upload(file) {
     toast("Upload failed. Check the connection.");
     setUploading(false);
   };
+  xhr.ontimeout = () => {
+    setConnected(false);
+    toast("Upload timed out. Try again.");
+    setUploading(false);
+  };
   xhr.onabort = () => {
     toast("Upload cancelled.");
     setUploading(false);
   };
+  xhr.timeout = 30000;
   xhr.send(file);
 }
 

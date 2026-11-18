@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"central-portal/internal/sanitize"
 )
 
 const (
@@ -168,13 +170,9 @@ func (b *Bar) rateLocked() float64 {
 	return float64(b.n) / secs
 }
 
-// cleanLabel hides control characters so terminal escape sequences in a file
-// name cannot corrupt the display.
+// cleanLabel hides control and formatting characters so terminal escape
+// sequences or bidirectional overrides in a file name cannot corrupt the
+// display.
 func cleanLabel(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return '?'
-		}
-		return r
-	}, s)
+	return sanitize.Clean(s)
 }

@@ -68,26 +68,65 @@ func Fingerprint(dir string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse CA certificate: %w", err)
 	}
+	return FormatFingerprint(cert), nil
+}
+
+// FormatFingerprint returns the SHA-256 of the certificate's DER encoding as
+// uppercase hexadecimal bytes separated by colons.
+func FormatFingerprint(cert *x509.Certificate) string {
 	sum := sha256.Sum256(cert.Raw)
 	parts := make([]string, len(sum))
 	for i, b := range sum {
 		parts[i] = fmt.Sprintf("%02X", b)
 	}
-	return strings.Join(parts, ":"), nil
+	return strings.Join(parts, ":")
 }
 
 // Ensure makes sure dir holds a usable CA and a server certificate covering
-// every host, creating or replacing them when needed, and returns the server
-// certificate for use by a TLS listener.
+// every host, creating them when absent, and returns the server certificate for
+// use by a TLS listener.
+//
+// An existing CA is never replaced implicitly: a missing, unreadable or invalid
+// CA file is reported as an error so that a broken installation cannot silently
+// invalidate the trust every device placed in the old CA. Call Reset to rotate
+// the CA deliberately.
 func Ensure(dir string, hosts []string) (tls.Certificate, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return tls.Certificate{}, fmt.Errorf("create certificate directory: %w", err)
 	}
-	ca, err := loadCA(dir)
+	if err := enforcePermissions(dir); err != nil {
+		return tls.Certificate{}, err
+	}
+	haveCert, err := fileExists(CAPath(dir))
 	if err != nil {
+		return tls.Certificate{}, err
+	}
+	haveKey, err := fileExists(filepath.Join(dir, caKeyFile))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	var ca *authority
+	switch {
+	case !haveCert && !haveKey:
 		ca, err = createCA(dir)
 		if err != nil {
 			return tls.Certificate{}, fmt.Errorf("create CA: %w", err)
+		}
+	case haveCert != haveKey:
+		present, missing := caCertFile, caKeyFile
+		if haveKey {
+			present, missing = caKeyFile, caCertFile
+		}
+		return tls.Certificate{}, fmt.Errorf(
+			"certificate directory %s is incomplete: %s exists but %s is missing; restore both files or rotate the CA explicitly (server -rotate-ca)",
+			dir, present, missing)
+	default:
+		ca, err = loadCA(dir)
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf(
+				"load CA from %s: %w; restore %s and %s or rotate the CA explicitly (server -rotate-ca)",
+				dir, err, caCertFile, caKeyFile)
 		}
 	}
 	hosts = uniqueHosts(hosts)
@@ -101,8 +140,53 @@ func Ensure(dir string, hosts []string) (tls.Certificate, error) {
 	return cert, nil
 }
 
+// Reset removes the CA and server certificate files so that Ensure can create a
+// new CA. Missing files are ignored. It is deliberately explicit because Ensure
+// never replaces an existing CA on its own.
+func Reset(dir string) error {
+	for _, name := range []string{caCertFile, caKeyFile, serverCertFile, serverKeyFile} {
+		path := filepath.Join(dir, name)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// fileExists reports whether path exists. Errors other than "not exist" are
+// returned so that a transient stat failure is not mistaken for an absent file.
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect %s: %w", path, err)
+	}
+}
+
+// enforcePermissions keeps the certificate directory private and the private
+// keys readable only by their owner.
+func enforcePermissions(dir string) error {
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("restrict certificate directory %s to 0700: %w", dir, err)
+	}
+	for _, name := range []string{caKeyFile, serverKeyFile} {
+		path := filepath.Join(dir, name)
+		if err := os.Chmod(path, 0o600); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("restrict private key %s to 0600: %w", path, err)
+		}
+	}
+	return nil
+}
+
 // loadCA reads the CA files and checks that they are usable. Any problem is
-// reported as an error so the caller can regenerate the CA.
+// reported as an error; the caller must not replace the CA implicitly.
 func loadCA(dir string) (*authority, error) {
 	certPEM, err := os.ReadFile(filepath.Join(dir, caCertFile))
 	if err != nil {

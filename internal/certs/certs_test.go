@@ -98,14 +98,14 @@ func TestEnsureRegeneratesLeafForNewHost(t *testing.T) {
 	caBefore := readFile(t, filepath.Join(dir, caCertFile))
 	leafBefore := readFile(t, filepath.Join(dir, serverCertFile))
 
-	cert, err := Ensure(dir, []string{"localhost", "portal.example", "192.0.2.20"})
+	cert, err := Ensure(dir, []string{"localhost", "portal.example", "10.1.2.3"})
 	if err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
 	if bytes.Equal(leafBefore, readFile(t, filepath.Join(dir, serverCertFile))) {
 		t.Error("server certificate was not regenerated for a new host")
 	}
-	for _, host := range []string{"localhost", "portal.example", "192.0.2.20"} {
+	for _, host := range []string{"localhost", "portal.example", "10.1.2.3"} {
 		if err := cert.Leaf.VerifyHostname(host); err != nil {
 			t.Errorf("regenerated leaf does not cover %s: %v", host, err)
 		}
@@ -136,33 +136,149 @@ func TestFingerprint(t *testing.T) {
 	}
 }
 
-func TestEnsureReplacesCorruptCA(t *testing.T) {
+func TestEnsureRejectsCorruptCA(t *testing.T) {
 	dir := t.TempDir()
 	hosts := []string{"localhost", "127.0.0.1"}
 	if _, err := Ensure(dir, hosts); err != nil {
 		t.Fatalf("first Ensure: %v", err)
 	}
-	before, err := Fingerprint(dir)
-	if err != nil {
-		t.Fatalf("Fingerprint: %v", err)
-	}
-	if err := os.WriteFile(CAPath(dir), []byte("not a certificate"), 0o644); err != nil {
+	corrupt := []byte("not a certificate")
+	if err := os.WriteFile(CAPath(dir), corrupt, 0o644); err != nil {
 		t.Fatalf("corrupt CA: %v", err)
+	}
+	if _, err := Ensure(dir, hosts); err == nil {
+		t.Fatal("Ensure succeeded with a corrupt CA, want an error")
+	}
+	if got := readFile(t, CAPath(dir)); !bytes.Equal(got, corrupt) {
+		t.Error("corrupt CA file was replaced")
+	}
+}
+
+func TestEnsureOneMissingCAFileErrors(t *testing.T) {
+	for _, missing := range []string{caCertFile, caKeyFile} {
+		t.Run(missing, func(t *testing.T) {
+			dir := t.TempDir()
+			hosts := []string{"localhost"}
+			if _, err := Ensure(dir, hosts); err != nil {
+				t.Fatalf("first Ensure: %v", err)
+			}
+			present := caKeyFile
+			if missing == caKeyFile {
+				present = caCertFile
+			}
+			presentBefore := readFile(t, filepath.Join(dir, present))
+			path := filepath.Join(dir, missing)
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove %s: %v", missing, err)
+			}
+			if _, err := Ensure(dir, hosts); err == nil {
+				t.Fatalf("Ensure succeeded with %s missing, want an error", missing)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("%s was recreated", missing)
+			}
+			if !bytes.Equal(presentBefore, readFile(t, filepath.Join(dir, present))) {
+				t.Errorf("%s changed while %s was missing", present, missing)
+			}
+		})
+	}
+}
+
+func TestEnsureCreatesMissingCA(t *testing.T) {
+	dir := t.TempDir()
+	hosts := []string{"localhost"}
+	if _, err := Ensure(dir, hosts); err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	for _, name := range []string{caCertFile, caKeyFile} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
 	}
 	cert, err := Ensure(dir, hosts)
 	if err != nil {
-		t.Fatalf("Ensure after corruption: %v", err)
-	}
-	after, err := Fingerprint(dir)
-	if err != nil {
-		t.Fatalf("Fingerprint after corruption: %v", err)
-	}
-	if before == after {
-		t.Error("CA fingerprint did not change after replacing a corrupt CA")
+		t.Fatalf("Ensure with both CA files absent: %v", err)
 	}
 	if err := cert.Leaf.VerifyHostname("localhost"); err != nil {
 		t.Errorf("new leaf does not cover localhost: %v", err)
 	}
+	if _, err := Fingerprint(dir); err != nil {
+		t.Errorf("Fingerprint after recreation: %v", err)
+	}
+}
+
+func TestResetAllowsRecreation(t *testing.T) {
+	dir := t.TempDir()
+	hosts := []string{"localhost"}
+	if _, err := Ensure(dir, hosts); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	before, err := Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	if err := Reset(dir); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	for _, name := range []string{caCertFile, caKeyFile, serverCertFile, serverKeyFile} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("%s still exists after Reset", name)
+		}
+	}
+	if err := Reset(dir); err != nil {
+		t.Errorf("second Reset: %v", err)
+	}
+	if _, err := Ensure(dir, hosts); err != nil {
+		t.Fatalf("Ensure after Reset: %v", err)
+	}
+	after, err := Fingerprint(dir)
+	if err != nil {
+		t.Fatalf("Fingerprint after Reset: %v", err)
+	}
+	if before == after {
+		t.Error("CA fingerprint did not change after Reset")
+	}
+}
+
+func TestEnsureEnforcesPermissions(t *testing.T) {
+	dir := t.TempDir()
+	hosts := []string{"localhost"}
+	if _, err := Ensure(dir, hosts); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	for _, name := range []string{caKeyFile, serverKeyFile} {
+		if err := os.Chmod(filepath.Join(dir, name), 0o644); err != nil {
+			t.Fatalf("chmod %s: %v", name, err)
+		}
+	}
+	if _, err := Ensure(dir, hosts); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := dirMode(t, dir); got != 0o700 {
+		t.Errorf("directory mode = %o, want 0700", got)
+	}
+	for _, name := range []string{caKeyFile, serverKeyFile} {
+		if got := fileMode(t, filepath.Join(dir, name)); got != 0o600 {
+			t.Errorf("%s mode = %o, want 0600", name, got)
+		}
+	}
+}
+
+func dirMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Mode().Perm()
+}
+
+func fileMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	return dirMode(t, path)
 }
 
 func readFile(t *testing.T, path string) []byte {

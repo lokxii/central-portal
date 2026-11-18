@@ -345,3 +345,81 @@ func TestTLSVerificationIsRequired(t *testing.T) {
 		t.Fatalf("request with CA failed: %v", err)
 	}
 }
+
+// TestStatusResponseHeaderTimeout covers a server that completes the TLS
+// handshake but never sends response headers: Status must fail instead of
+// hanging forever.
+func TestStatusResponseHeaderTimeout(t *testing.T) {
+	release := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	})
+	c, _ := testClient(t, h)
+	t.Cleanup(func() { close(release) })
+
+	tr, ok := c.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T, want *http.Transport", c.http.Transport)
+	}
+	tr.ResponseHeaderTimeout = 50 * time.Millisecond
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.Status(context.Background())
+		errc <- err
+	}()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("Status succeeded, want a timeout error")
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "timeout") {
+			t.Fatalf("error = %v, want a timeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Status hung waiting for response headers")
+	}
+}
+
+// TestGetFileRejectsOversizedResponse checks the size cap is enforced from
+// Content-Length alone, before any body is read or written.
+func TestGetFileRejectsOversizedResponse(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(maxFileBytes+1, 10))
+		w.WriteHeader(http.StatusOK)
+	})
+	c, _ := testClient(t, h)
+
+	var dst bytes.Buffer
+	n, err := c.GetFile(context.Background(), &dst)
+	if err == nil {
+		t.Fatal("GetFile succeeded, want an oversize error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("error = %v, want a size-limit message", err)
+	}
+	if n != 0 {
+		t.Fatalf("GetFile returned %d bytes, want 0", n)
+	}
+	if dst.Len() != 0 {
+		t.Fatalf("GetFile wrote %d bytes to dst, want 0", dst.Len())
+	}
+}
+
+// TestRedirectRejected checks that the client does not follow a redirect away
+// from the configured portal.
+func TestRedirectRejected(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://evil.example/steal", http.StatusFound)
+	})
+	c, _ := testClient(t, h)
+
+	_, err := c.Status(context.Background())
+	if err == nil {
+		t.Fatal("Status followed a redirect, want an error")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("error = %v, want a redirect error", err)
+	}
+}

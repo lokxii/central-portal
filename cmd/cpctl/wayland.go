@@ -7,11 +7,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"central-portal/internal/model"
+	"central-portal/internal/sanitize"
+)
+
+const (
+	// clipboardCommandTimeout bounds every wl-paste/wl-copy invocation. A
+	// compositor or tool that hangs must not stall the command forever.
+	clipboardCommandTimeout = 30 * time.Second
+	// maxListTypesBytes is generous for a MIME list but stops a runaway
+	// producer from exhausting memory.
+	maxListTypesBytes = 1 << 20
+	maxPasteBytes     = 16 << 20
 )
 
 // clipboardImageTypes lists the image formats the portal accepts, in order of
@@ -40,12 +53,10 @@ func readWaylandClipboard(ctx context.Context) ([]byte, string, error) {
 		return nil, "", err
 	}
 
-	var stderr bytes.Buffer
-	list := exec.CommandContext(ctx, "wl-paste", "--list-types")
-	list.Stderr = &stderr
-	out, err := list.Output()
+	out, err := runClipboardCommand(ctx, clipboardCommandTimeout, maxListTypesBytes, nil,
+		"wl-paste", "--list-types")
 	if err != nil {
-		return nil, "", commandError("wl-paste --list-types", err, stderr.String())
+		return nil, "", err
 	}
 
 	var types []string
@@ -56,19 +67,16 @@ func readWaylandClipboard(ctx context.Context) ([]byte, string, error) {
 	}
 	mime, isText := chooseClipboardType(types)
 	if mime == "" {
-		return nil, "", errors.New("Wayland clipboard has no text or image content")
+		return nil, "", errors.New("wayland clipboard has no text or image content")
 	}
 
 	args := []string{"--type", mime}
 	if isText {
 		args = append([]string{"--no-newline"}, args...)
 	}
-	stderr.Reset()
-	paste := exec.CommandContext(ctx, "wl-paste", args...)
-	paste.Stderr = &stderr
-	data, err := paste.Output()
+	data, err := runClipboardCommand(ctx, clipboardCommandTimeout, maxPasteBytes, nil, "wl-paste", args...)
 	if err != nil {
-		return nil, "", commandError("wl-paste", err, stderr.String())
+		return nil, "", err
 	}
 	if isText {
 		return data, model.ContentTypeText, nil
@@ -104,19 +112,66 @@ func writeWaylandClipboard(ctx context.Context, data []byte, contentType string)
 	if mime == "" || strings.HasPrefix(strings.ToLower(mime), "text/") {
 		mime = "text/plain;charset=utf-8"
 	}
-	var stderr bytes.Buffer
-	copyCmd := exec.CommandContext(ctx, "wl-copy", "--type", mime)
-	copyCmd.Stdin = bytes.NewReader(data)
-	copyCmd.Stderr = &stderr
-	if err := copyCmd.Run(); err != nil {
-		return commandError("wl-copy", err, stderr.String())
-	}
-	return nil
+	_, err := runClipboardCommand(ctx, clipboardCommandTimeout, maxListTypesBytes,
+		bytes.NewReader(data), "wl-copy", "--type", mime)
+	return err
 }
 
-// commandError keeps the tool's own diagnostic visible.
+// errOutputLimit reports that a command produced more output than allowed.
+var errOutputLimit = errors.New("output exceeds limit")
+
+// boundedBuffer collects command output up to limit bytes. Once the limit is
+// crossed it fails writes, which makes the child process fail rather than
+// letting it allocate without bound.
+type boundedBuffer struct {
+	buf      bytes.Buffer
+	limit    int64
+	overflow bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	remaining := b.limit - int64(b.buf.Len())
+	if int64(len(p)) <= remaining {
+		return b.buf.Write(p)
+	}
+	if remaining > 0 {
+		b.buf.Write(p[:remaining])
+	}
+	b.overflow = true
+	return int(remaining), errOutputLimit
+}
+
+// runClipboardCommand runs one wl-clipboard tool with a timeout, a bounded
+// stdout and captured stderr. A nil stdin leaves standard input untouched.
+func runClipboardCommand(ctx context.Context, timeout time.Duration, limit int64, stdin io.Reader, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout boundedBuffer
+	stdout.limit = limit
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Stdin = stdin
+
+	err := cmd.Run()
+	if stdout.overflow {
+		return nil, fmt.Errorf("%s output is larger than %d MiB", name, limit>>20)
+	}
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%s timed out after %s", name, timeout)
+		}
+		return nil, commandError(name, err, stderr.String())
+	}
+	return stdout.buf.Bytes(), nil
+}
+
+// commandError keeps the tool's own diagnostic visible. The text is sanitized
+// because it is printed to a terminal.
 func commandError(name string, err error, stderr string) error {
-	if msg := strings.TrimSpace(stderr); msg != "" {
+	if msg := sanitize.Clean(strings.TrimSpace(stderr)); msg != "" {
 		return fmt.Errorf("%s: %w: %s", name, err, msg)
 	}
 	return fmt.Errorf("%s: %w", name, err)

@@ -58,6 +58,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+required_tools="go curl openssl sha256sum node base64 seq"
+for tool in $required_tools; do
+	command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
+done
+say "required tools are available"
+
 start_server() {
 	"$tmp/central-portal" -addr "127.0.0.1:${https_port}" -http-addr "127.0.0.1:${http_port}" \
 		-data "$tmp/data" -max-clipboard-bytes 1048576 -max-file-bytes 5242880 \
@@ -102,6 +108,10 @@ say "bootstrap CA is a valid CA certificate"
 assert_eq "$(curl -fsS --cacert "$tmp/ca.crt" "$base/api/status" | json_get clipboard)" "" "empty clipboard is null in status"
 assert_eq "$(curl -fsS --cacert "$tmp/ca.crt" "$base/api/status" | json_get file)" "" "empty file is null in status"
 assert_eq "$(curl -s -o /dev/null -w '%{http_code}' --cacert "$tmp/ca.crt" "$base/api/clipboard")" "404" "empty clipboard returns 404"
+
+read -r head_code head_size <<<"$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -I --cacert "$tmp/ca.crt" "$base/api/status")"
+assert_eq "$head_code" "200" "HEAD /api/status returns 200"
+assert_eq "$head_size" "0" "HEAD /api/status has an empty body"
 
 echo
 echo "== clipboard registry"
@@ -167,6 +177,11 @@ say "CLI file upload prints progress"
 curl -fsS --cacert "$tmp/ca.crt" -o "$tmp/download.bin" "$base/api/file"
 assert_eq "$(sha256sum "$tmp/download.bin" | cut -d' ' -f1)" "$sum_before" "file bytes roundtrip through the API"
 
+range_code=$(curl -s -o "$tmp/range.bin" -w '%{http_code}' --cacert "$tmp/ca.crt" -r 100-199 "$base/api/file")
+assert_eq "$range_code" "206" "Range request returns 206"
+dd if="$tmp/report.bin" of="$tmp/range.expected" bs=1 skip=100 count=100 2>/dev/null
+assert_eq "$(sha256sum "$tmp/range.bin" | cut -d' ' -f1)" "$(sha256sum "$tmp/range.expected" | cut -d' ' -f1)" "Range returns exactly the requested bytes"
+
 mkdir -p "$tmp/downloads"
 "$tmp/cpctl" file pull -server "$base" -ca "$tmp/ca.crt" "$tmp/downloads" >"$tmp/out" 2>"$tmp/err"
 assert_contains "$(cat "$tmp/out")" "Saved" "CLI saves a file"
@@ -207,9 +222,11 @@ assert_contains "$headers" "X-Content-Type-Options: nosniff" "nosniff header is 
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$tmp/ca.crt" "$base/missing.txt")
 assert_eq "$code" "404" "unknown static path returns 404"
+assert_contains "$(curl -sD - -o /dev/null --cacert "$tmp/ca.crt" "$base/missing.txt")" "Cache-Control: no-store" "404 responses are not cached"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$tmp/ca.crt" -X DELETE "$base/api/clipboard")
 assert_eq "$code" "405" "unsupported method returns 405"
+assert_contains "$(curl -sD - -o /dev/null --cacert "$tmp/ca.crt" -X DELETE "$base/api/clipboard")" "Cache-Control: no-store" "405 responses are not cached"
 
 assert_contains "$(curl -sI --cacert "$tmp/ca.crt" "$base/manifest.webmanifest")" "application/manifest+json" "manifest is served with the PWA media type"
 
@@ -241,6 +258,12 @@ say "app shell has no inline scripts or handlers"
 
 curl -fsS "http://127.0.0.1:${http_port}/" -o "$tmp/onboard.html"
 assert_contains "$(cat "$tmp/onboard.html")" "ca.crt" "bootstrap page links the CA certificate"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${http_port}/")
+assert_eq "$code" "405" "bootstrap POST / is rejected with 405"
+bootstrap_headers=$(curl -sI "http://127.0.0.1:${http_port}/")
+assert_contains "$bootstrap_headers" "Referrer-Policy: no-referrer" "bootstrap onboarding sets a referrer policy"
+assert_contains "$bootstrap_headers" "Content-Security-Policy" "bootstrap onboarding sets a CSP"
 
 echo
 echo "== CLI CA bootstrap and TLS verification"

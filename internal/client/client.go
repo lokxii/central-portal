@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"central-portal/internal/model"
+	"central-portal/internal/sanitize"
 )
 
 // ErrEmpty reports that a registry has no content yet (HTTP 404).
@@ -33,7 +34,13 @@ const (
 	maxClipboardBytes = 16 << 20
 	maxErrorBytes     = 4 << 10
 	maxJSONBytes      = 1 << 20
+	// maxFileBytes bounds file downloads so a broken or hostile server cannot
+	// fill the disk. It matches the largest file the portal is meant to store.
+	maxFileBytes = 1 << 30
 )
+
+// maxRedirects bounds how many redirects the API client follows.
+const maxRedirects = 10
 
 // Client talks to one portal server.
 type Client struct {
@@ -41,7 +48,7 @@ type Client struct {
 	http *http.Client
 }
 
-// New returns a client for server, for example "https://portal.example:8443".
+// New returns a client for server, for example "https://172.22.73.152:8443".
 //
 // When caFile is non-empty its certificates are added to the system roots so
 // the portal's self-signed CA is trusted. Certificate verification is always
@@ -79,6 +86,7 @@ func New(server, caFile string) (*Client, error) {
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSClientConfig:       tlsConfig,
 		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		ExpectContinueTimeout: time.Second,
 		ForceAttemptHTTP2:     true,
@@ -88,7 +96,30 @@ func New(server, caFile string) (*Client, error) {
 	if path := strings.TrimRight(u.EscapedPath(), "/"); path != "" {
 		base += path
 	}
-	return &Client{base: base, http: &http.Client{Transport: transport}}, nil
+	return &Client{
+		base: base,
+		http: &http.Client{Transport: transport, CheckRedirect: checkRedirect},
+	}, nil
+}
+
+// checkRedirect keeps the client on the portal it was configured for. The
+// portal has no reason to redirect, and following a redirect would leak
+// credentials or downgrade the connection.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= maxRedirects {
+		return errors.New("stopped after too many redirects")
+	}
+	orig := via[0].URL
+	if !strings.EqualFold(req.URL.Host, orig.Host) {
+		return fmt.Errorf("refusing redirect to another host: %s", sanitize.Clean(req.URL.Host))
+	}
+	if orig.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect from https to %s", sanitize.Clean(req.URL.Scheme))
+	}
+	return nil
 }
 
 // Status returns the metadata of both registries.
@@ -157,7 +188,6 @@ func (c *Client) GetClipboard(ctx context.Context, w io.Writer) ([]byte, string,
 // the stored entry type; an empty value means text. The uploaded bytes are
 // copied to w as they are sent (w may be nil).
 func (c *Client) PutClipboard(ctx context.Context, data []byte, contentType string, w io.Writer) (model.Entry, error) {
-	var e model.Entry
 	if contentType == "" {
 		contentType = model.ContentTypeText
 	}
@@ -167,30 +197,23 @@ func (c *Client) PutClipboard(ctx context.Context, data []byte, contentType stri
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+"/api/clipboard", body)
 	if err != nil {
-		return e, err
+		return model.Entry{}, err
 	}
 	req.ContentLength = int64(len(data))
 	req.Header.Set("Content-Type", contentType)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return e, networkError(err)
+		return model.Entry{}, networkError(err)
 	}
 	defer resp.Body.Close()
-	if err := responseError(resp); err != nil {
-		return e, err
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONBytes)).Decode(&e); err != nil {
-		return e, fmt.Errorf("decode response: %w", err)
-	}
-	return e, nil
+	return decodeEntry(resp)
 }
 
 // PutFile replaces the file registry with the bytes read from r. size must be
 // the exact number of bytes in r. The bytes are copied to w as they are sent
 // (w may be nil).
 func (c *Client) PutFile(ctx context.Context, name string, r io.Reader, size int64, w io.Writer) (model.Entry, error) {
-	var e model.Entry
 	var body io.Reader = r
 	if w != nil {
 		body = io.TeeReader(r, w)
@@ -198,25 +221,20 @@ func (c *Client) PutFile(ctx context.Context, name string, r io.Reader, size int
 	target := c.base + "/api/file?name=" + url.QueryEscape(name)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, body)
 	if err != nil {
-		return e, err
+		return model.Entry{}, err
 	}
 	req.ContentLength = size
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return e, networkError(err)
+		return model.Entry{}, networkError(err)
 	}
 	defer resp.Body.Close()
-	if err := responseError(resp); err != nil {
-		return e, err
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONBytes)).Decode(&e); err != nil {
-		return e, fmt.Errorf("decode response: %w", err)
-	}
-	return e, nil
+	return decodeEntry(resp)
 }
 
 // GetFile downloads the file registry into dst and returns the byte count.
+// A response that declares or delivers more than maxFileBytes is rejected.
 func (c *Client) GetFile(ctx context.Context, dst io.Writer) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/file", nil)
 	if err != nil {
@@ -233,14 +251,32 @@ func (c *Client) GetFile(ctx context.Context, dst io.Writer) (int64, error) {
 	if err := responseError(resp); err != nil {
 		return 0, err
 	}
-	n, err := io.Copy(dst, resp.Body)
+	if resp.ContentLength > maxFileBytes {
+		return 0, fmt.Errorf("file response exceeds %d MiB", maxFileBytes>>20)
+	}
+	n, err := io.Copy(dst, io.LimitReader(resp.Body, maxFileBytes+1))
 	if err != nil {
 		return n, err
+	}
+	if n > maxFileBytes {
+		return 0, fmt.Errorf("file response exceeds %d MiB", maxFileBytes>>20)
 	}
 	if resp.ContentLength >= 0 && n != resp.ContentLength {
 		return n, fmt.Errorf("file response truncated: got %d of %d bytes", n, resp.ContentLength)
 	}
 	return n, nil
+}
+
+// decodeEntry reads the entry JSON of a successful upload response.
+func decodeEntry(resp *http.Response) (model.Entry, error) {
+	var e model.Entry
+	if err := responseError(resp); err != nil {
+		return e, err
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxJSONBytes)).Decode(&e); err != nil {
+		return e, fmt.Errorf("decode response: %w", err)
+	}
+	return e, nil
 }
 
 // responseError converts a non-2xx response into an error that carries the

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,8 +31,30 @@ const (
 	// maxNameRunes limits the client-supplied file name.
 	maxNameRunes = 200
 
+	// idleTimeout is how long a single body read or response write may stall
+	// before the connection is closed. It applies per operation, so large
+	// transfers are fine as long as they keep making progress.
+	idleTimeout = 30 * time.Second
+
 	contentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'"
 )
+
+// ResolveListenAddr turns a configured listen address into a concrete one.
+//
+// The special value "auto" binds the ZeroTier IPv4 address when ztIP is set
+// and otherwise falls back to loopback on port. loopback reports that fallback
+// so the caller can warn. Any other value is returned unchanged, which keeps
+// an explicit ":8443" or "0.0.0.0:8443" as the documented escape hatch for
+// binding every interface.
+func ResolveListenAddr(opt, ztIP, port string) (addr string, loopback bool) {
+	if opt != "auto" {
+		return opt, false
+	}
+	if ztIP == "" {
+		return net.JoinHostPort("127.0.0.1", port), true
+	}
+	return net.JoinHostPort(ztIP, port), false
+}
 
 var errEmptyUpload = errors.New("empty upload")
 
@@ -301,7 +324,7 @@ func sanitizeName(raw string) (string, bool) {
 		return "", false
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) {
+		if unsafeNameRune(r) {
 			return "", false
 		}
 	}
@@ -309,6 +332,29 @@ func sanitizeName(raw string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+// unsafeNameRune reports characters that can spoof or reorder a displayed name:
+// controls, bidi overrides/isolates, zero-width marks, a BOM, and line or
+// paragraph separators. Ordinary Unicode, including emoji and their joiners, is
+// allowed.
+func unsafeNameRune(r rune) bool {
+	if unicode.IsControl(r) {
+		return true
+	}
+	switch {
+	case r >= 0x202a && r <= 0x202e, // LRE, RLE, PDF, LRO, RLO
+		r >= 0x2066 && r <= 0x2069, // LRI, RLI, FSI, PDI
+		r == 0x200b,                // zero-width space
+		r == 0x200c,                // zero-width non-joiner
+		r == 0x200e,                // left-to-right mark
+		r == 0x200f,                // right-to-left mark
+		r == 0xfeff,                // zero-width no-break space / BOM
+		r == 0x2028,                // line separator
+		r == 0x2029:                // paragraph separator
+		return true
+	}
+	return false
 }
 
 // contentDisposition builds a safe attachment header for name. Non-ASCII
@@ -349,14 +395,20 @@ func (n *nonEmptyReader) Read(p []byte) (int, error) {
 	return 0, err
 }
 
-// withMiddleware adds security headers, request logging and panic recovery.
+// withMiddleware adds security headers, default caching, per-operation I/O
+// deadlines, request logging and panic recovery.
 func (h *handler) withMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		rc := http.NewResponseController(w)
+		sw := &statusWriter{ResponseWriter: &deadlineWriter{ResponseWriter: w, rc: rc}, status: http.StatusOK}
+		sw.Header().Set("Cache-Control", "no-store")
 		sw.Header().Set("X-Content-Type-Options", "nosniff")
 		sw.Header().Set("Referrer-Policy", "no-referrer")
 		sw.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		if r.Body != nil && r.Body != http.NoBody {
+			r.Body = &deadlineReader{r: r.Body, rc: rc}
+		}
 		defer func() {
 			if v := recover(); v != nil {
 				h.logger.Error("panic serving request", "method", r.Method, "path", r.URL.Path, "panic", v)
@@ -405,5 +457,39 @@ func (w *statusWriter) Write(p []byte) (int, error) {
 
 // Unwrap gives http.ResponseController access to the underlying writer.
 func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// deadlineReader refreshes the read deadline before every body read so a slow
+// or stalled upload cannot hold a connection forever. There is deliberately no
+// total timeout: a large upload may run as long as it keeps progressing.
+type deadlineReader struct {
+	r  io.ReadCloser
+	rc *http.ResponseController
+}
+
+func (d *deadlineReader) Read(p []byte) (int, error) {
+	_ = d.rc.SetReadDeadline(time.Now().Add(idleTimeout))
+	return d.r.Read(p)
+}
+
+func (d *deadlineReader) Close() error {
+	return d.r.Close()
+}
+
+// deadlineWriter refreshes the write deadline before every response write, so a
+// client that stops reading cannot pin a download forever.
+type deadlineWriter struct {
+	http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	_ = w.rc.SetWriteDeadline(time.Now().Add(idleTimeout))
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap keeps http.ResponseController (and Flush/Hijack helpers) working.
+func (w *deadlineWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }

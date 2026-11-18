@@ -3,3 +3,11 @@
 /node_modules/
 /server
 /cpctl
+
+# secrets and local artifacts
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+*.log

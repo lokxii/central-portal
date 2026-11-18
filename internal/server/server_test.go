@@ -461,3 +461,69 @@ func TestSecurityHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestErrorResponsesAreNotCached(t *testing.T) {
+	h := newTestHandler(t)
+	for _, tc := range []struct{ method, target string }{
+		{"GET", "/missing.txt"},
+		{"POST", "/api/status"},
+		{"GET", "/api/clipboard"},
+		{"GET", "/ca.crt/missing"},
+	} {
+		rec := do(t, h, tc.method, tc.target, "", false)
+		if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s = %d, want 404 or 405", tc.method, tc.target, rec.Code)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+			t.Errorf("%s %s Cache-Control = %q, want no-store", tc.method, tc.target, got)
+		}
+	}
+}
+
+func TestResolveListenAddr(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		opt      string
+		ztIP     string
+		port     string
+		wantAddr string
+		wantLoop bool
+	}{
+		{"auto with zerotier", "auto", "10.42.0.7", "8443", "10.42.0.7:8443", false},
+		{"auto without zerotier", "auto", "", "8443", "127.0.0.1:8443", true},
+		{"auto bootstrap fallback", "auto", "", "8080", "127.0.0.1:8080", true},
+		{"explicit all interfaces", ":8443", "10.42.0.7", "8443", ":8443", false},
+		{"explicit wildcard", "0.0.0.0:8443", "", "8443", "0.0.0.0:8443", false},
+		{"explicit loopback", "127.0.0.1:19443", "", "8443", "127.0.0.1:19443", false},
+	} {
+		addr, loop := ResolveListenAddr(tc.opt, tc.ztIP, tc.port)
+		if addr != tc.wantAddr || loop != tc.wantLoop {
+			t.Errorf("%s: ResolveListenAddr(%q, %q, %q) = (%q, %v), want (%q, %v)",
+				tc.name, tc.opt, tc.ztIP, tc.port, addr, loop, tc.wantAddr, tc.wantLoop)
+		}
+	}
+}
+
+func TestSanitizeNameRejectsSpoofing(t *testing.T) {
+	for _, name := range []string{
+		"invoice\u202egnp.exe", // RLO
+		"file\u2066txt\u2069",  // bidi isolates
+		"zero\u200bwidth",      // zero-width space
+		"zero\u200cwidth",      // zero-width non-joiner
+		"left\u200emark",       // LTR mark
+		"right\u200fmark",      // RTL mark
+		"bom\ufeffname",        // BOM
+		"line\u2028sep",        // line separator
+		"para\u2029sep",        // paragraph separator
+		"control\x01name",      // C0 control
+	} {
+		if got, ok := sanitizeName(name); ok {
+			t.Errorf("sanitizeName(%q) = (%q, true), want rejected", name, got)
+		}
+	}
+	for _, name := range []string{"notes.txt", "naïve 文件.txt", "😀 party.txt", "👨\u200d👩\u200d👧.png"} {
+		if got, ok := sanitizeName(name); !ok || got != name {
+			t.Errorf("sanitizeName(%q) = (%q, %v), want accepted unchanged", name, got, ok)
+		}
+	}
+}

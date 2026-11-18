@@ -5,17 +5,23 @@ CLI) are built against this document.
 
 - **HTTPS base URL:** `https://<zerotier-ip>:8443`
 - **Bootstrap HTTP base URL:** `http://<zerotier-ip>:8080`
-- **Auth:** none. Access control is the ZeroTier network itself. Bind the
-  service to the tunnel address (or firewall it) and do not expose it publicly.
+- **Auth:** none. Access control is the ZeroTier network itself. The default
+  `auto` listen addresses bind the tunnel IPv4 when it is up (loopback
+  otherwise); passing a wildcard address such as `:8443` deliberately exposes
+  the service on every interface. Do not expose it publicly.
 - **Version:** v1
 
 ## Conventions
 
 - Control endpoints return UTF-8 JSON. Payload endpoints (`/api/clipboard`,
   `/api/file`) return raw bytes.
-- API responses carry `Cache-Control: no-store`.
+- API responses carry `Cache-Control: no-store`, including error responses
+  (`404`, `405`, `413`, and so on). The bootstrap listener sets it on
+  `/ca.crt` as well; static PWA assets use `no-cache` instead (see below).
 - Errors are `text/plain; charset=utf-8` bodies with a short human-readable
-  message, plus a meaningful status code.
+  message, plus a meaningful status code. They also carry
+  `X-Content-Type-Options: nosniff` and the same CSP/referrer policy as other
+  responses.
 - Every upload **replaces** the whole registry. Replacement is atomic: a
   concurrent reader sees either the previous item or the new one, never a
   partial write.
@@ -24,7 +30,7 @@ CLI) are built against this document.
   `Content-Length`.
 - Client-supplied file names are metadata only. The server never uses them as
   filesystem paths; it reduces them to a basename before storing them.
-- `HEAD` is accepted wherever `GET` is accepted.
+- `HEAD` is accepted wherever `GET` is accepted, with an empty body.
 - No CORS headers. The browser app is served from the same origin.
 
 ## Data types
@@ -86,7 +92,11 @@ Downloads the clipboard registry.
 - **404** — clipboard registry is empty.
 
 The server stores the bytes as uploaded. It does not detect encoding, transcode
-images, or append a newline.
+images, or append a newline. Text is always stored as
+`text/plain; charset=utf-8`, regardless of the charset or other parameters on a
+`text/plain` request. A Wayland clipboard may normalize line endings or a
+trailing newline before upload, so the stored text can differ subtly from what
+was originally on the clipboard.
 
 ### `PUT /api/clipboard`
 
@@ -118,10 +128,15 @@ registry content must never be able to execute in the portal origin.
 Downloads the file registry.
 
 - **200** — `Content-Type: application/octet-stream`, `Content-Length`,
-  `Last-Modified`, and
-  `Content-Disposition: attachment; filename="…"; filename*=UTF-8''…` when the
-  name contains non-ASCII characters.
-- Supports `Range` requests (`206`).
+  `Last-Modified`, and a `Content-Disposition: attachment` header with a
+  `filename` parameter for ASCII names (quoted when needed). Non-ASCII names
+  use the RFC 5987 fallback
+  `filename="download"; filename*=UTF-8''<percent-encoded name>` so the header
+  itself stays ASCII.
+- **206** — a `Range` request was satisfied; the body contains exactly the
+  requested bytes.
+- **416** — the `Range` is unsatisfiable (for example it starts past the end of
+  the file).
 - **404** — file registry is empty.
 
 ### `PUT /api/file?name=<filename>`
@@ -129,12 +144,12 @@ Downloads the file registry.
 Overwrites the file registry with the request body.
 
 - **Query:** `name` is required. It is sanitized to a basename (both `/` and
-  `\` are treated as separators), control characters are rejected, and an empty
-  name is rejected.
+  `\` are treated as separators), control characters are rejected, an empty name
+  is rejected, and names longer than 200 Unicode runes are rejected.
 - **Request:** raw file bytes.
 - **Limit:** `-max-file-bytes`, default 1 GiB.
 - **200** — `Entry` of the stored file.
-- **400** — missing or invalid `name`.
+- **400** — missing, invalid, or over-long `name`.
 - **413** — body exceeds the limit; the previous file is unchanged.
 
 ### `GET /ca.crt`
@@ -143,7 +158,8 @@ Serves the PEM-encoded local CA certificate. Available on **both** listeners
 (HTTPS `:8443` and bootstrap HTTP `:8080`) so a new device can install trust
 before its first HTTPS request.
 
-- **200** — `Content-Type: application/x-x509-ca-cert`, PEM body.
+- **200** — `Content-Type: application/x-x509-ca-cert`,
+  `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, PEM body.
 
 ### `GET /` (HTTPS, browser app)
 
@@ -183,9 +199,16 @@ Only two routes exist, because HTTPS cannot be used before the CA is trusted:
 
 - `GET /ca.crt` — same certificate as above.
 - `GET /{$}` — tiny HTML onboarding page linking to `/ca.crt` and to the HTTPS
-  portal.
-- Everything else: **404**. The listener never redirects to HTTPS (that would
-  just show a certificate warning).
+  portal. It sets `Referrer-Policy: no-referrer`, `X-Content-Type-Options:
+  nosniff`, and a strict CSP. The page has no scripts.
+- Unknown paths: **404**.
+- Wrong method on a known path (for example `POST /` or `POST /ca.crt`):
+  **405 Method Not Allowed**, with an `Allow: GET, HEAD` header.
+- Bootstrap `404`/`405` responses also carry `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and the
+  bootstrap CSP.
+- The listener never redirects to HTTPS (that would just show a certificate
+  warning).
 
 ## Error summary
 
@@ -196,6 +219,7 @@ Only two routes exist, because HTTPS cannot be used before the CA is trusted:
 | 405 | Method not allowed for this path |
 | 413 | Upload exceeds the configured limit |
 | 415 | Unsupported clipboard media type |
+| 416 | Unsatisfiable `Range` request |
 | 500 | Server-side I/O failure (check server log) |
 
 ## Client responsibilities
@@ -204,23 +228,31 @@ Only two routes exist, because HTTPS cannot be used before the CA is trusted:
   certificate verification. A client without the CA may report an unknown
   authority error and should point at `ca.crt`.
 - **Bootstrap:** fetch `ca.crt` over the HTTP listener only, verify it is a CA
-  certificate, and print its SHA-256 fingerprint so the user can compare it
-  with the server log.
+  certificate, save just that one certificate (reject a response that contains
+  multiple certificates), and print its SHA-256 fingerprint so the user can
+  compare it with the server log. `-fingerprint` pins the expected value and
+  must abort on a mismatch. The default URL is
+  `http://<server-host>:8080/ca.crt`; `-ca-url` overrides it.
 - **Clipboard:** Wayland only. Refuse to read or write the clipboard when
   `WAYLAND_DISPLAY` is unset or `wl-copy`/`wl-paste` is missing, and do so
   before performing any transfer so the failure is safe. Wayland clipboards can
   hold text or an image; prefer `image/png`, then `image/jpeg`, `image/webp`,
   `image/gif`, then the first `text/*` MIME type. Restore images with
-  `wl-copy --type <contentType>`; use `text/plain;charset=utf-8` for text.
+  `wl-copy --type <contentType>`; for text use `text/plain;charset=utf-8`.
+  The server canonicalizes every text upload to `text/plain; charset=utf-8`,
+  and a Wayland clipboard may normalize line endings or a trailing newline
+  before the upload, so do not promise byte-identical text round trips.
 - **Images:** send the declared clipboard `Content-Type` on upload and keep the
   server-provided type on download. Never assume text when `contentType` starts
   with `image/`. The browser app may convert a non-PNG image to PNG locally only
   for `ClipboardItem`; the registry itself is never converted.
 - **Progress:** derive totals from `Content-Length` (downloads) and file size
-  (uploads), and render progress on stderr.
-- **Downloads:** write to `<destination>.part`, then rename on success; delete
-  the partial file on failure. Default destination is `~/Downloads`, keeping
-  the server-provided basename.
+  (uploads), render progress on stderr, and bound the wait for response headers
+  so an unresponsive peer fails instead of hanging.
+- **Downloads:** write to a unique temporary file in the destination directory,
+  then rename on success; delete the temporary file on failure. Default
+  destination is `~/Downloads`, keeping the server-provided basename. Refuse a
+  file download larger than 1 GiB rather than filling the local disk.
 - **Polling:** `/api/status` is safe to poll; the browser app does so every
   10 seconds while visible.
 
@@ -228,11 +260,18 @@ Only two routes exist, because HTTPS cannot be used before the CA is trusted:
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-addr` | `:8443` | HTTPS listen address |
-| `-http-addr` | `:8080` | bootstrap HTTP listen address; empty disables it |
+| `-addr` | `auto` | HTTPS listen address; `auto` = ZeroTier IPv4 if present, else loopback |
+| `-http-addr` | `auto` | bootstrap HTTP listen address; empty disables it |
 | `-data` | `data` | directory for registries and certificates |
+| `-rotate-ca` | `false` | replace the local CA and issue a new server certificate |
 | `-max-clipboard-bytes` | `16777216` | clipboard upload limit |
 | `-max-file-bytes` | `1073741824` | file upload limit |
+
+`auto` never binds all interfaces. Passing an explicit wildcard address
+(`-addr :8443`, `-addr 0.0.0.0:8443`) is the deliberate escape hatch for hosts
+that should listen beyond ZeroTier and loopback. `certs.Ensure` never replaces an
+existing CA silently; use `-rotate-ca` or remove `data/certs/ca.*` to recover
+from a corrupt CA.
 
 ## CLI surface (consumer of this API)
 
@@ -242,7 +281,7 @@ cpctl clip pull [-stdout]          # registry -> Wayland clipboard (text or imag
 cpctl file push <path>             # file -> registry
 cpctl file pull [destination]      # registry -> destination (default ~/Downloads)
 cpctl status                       # print both registry entries
-cpctl ca [-ca-url <url>] [-out <path>]  # install the CA certificate locally
+cpctl ca [-ca-url <url>] [-out <path>] [-fingerprint <AA:BB:…>]
 ```
 
 `clip push` picks the best available Wayland type (image before text) and sends
@@ -250,6 +289,13 @@ its MIME type; `-text` always uploads text. `clip pull` writes the stored type
 back to Wayland and prints `Copied <size> <contentType> to the Wayland
 clipboard`; `-stdout` writes the raw bytes without adding a newline.
 
-Connection flags on every command: `-server` (or env `CP_SERVER`; required when
-neither is set) and `-ca` (or env `CP_CA`, default
-`~/.config/central-portal/ca.crt` when that file exists).
+`cpctl ca` fetches over plain HTTP, defaulting to
+`http://<server-host>:8080/ca.crt` unless `-ca-url` is supplied. It saves only
+the single CA certificate it downloaded and rejects multi-certificate bundles,
+then prints the SHA-256 fingerprint. `-fingerprint` pins that value and fails
+the command on a mismatch; use it to compare with the server log before trusting
+the CA.
+
+Connection flags on every command: `-server` (env `CP_SERVER`; there is no
+built-in address, so one of the two is required) and `-ca` (env `CP_CA`,
+default `~/.config/central-portal/ca.crt` when that file exists).

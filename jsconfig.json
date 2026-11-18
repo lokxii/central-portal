@@ -10,5 +10,5 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "skipLibCheck": true
   },
-  "include": ["web/static/app.js"]
+  "include": ["web/static/app.js", "web/static/sw.js"]
 }

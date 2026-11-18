@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -21,9 +20,11 @@ import (
 	"syscall"
 	"time"
 
+	"central-portal/internal/certs"
 	"central-portal/internal/client"
 	"central-portal/internal/model"
 	"central-portal/internal/progress"
+	"central-portal/internal/sanitize"
 )
 
 var (
@@ -37,7 +38,7 @@ const (
 	usageFilePush = "usage: cpctl file push <path> [-server URL] [-ca PATH]\n"
 	usageFilePull = "usage: cpctl file pull [destination] [-server URL] [-ca PATH]\n"
 	usageStatus   = "usage: cpctl status [-server URL] [-ca PATH]\n"
-	usageCA       = "usage: cpctl ca [-ca-url URL] [-out PATH] [-server URL] [-ca PATH]\n"
+	usageCA       = "usage: cpctl ca [-ca-url URL] [-out PATH] [-fingerprint SHA256] [-server URL] [-ca PATH]\n"
 )
 
 var usageText = `cpctl is the command line client for the central portal.
@@ -48,7 +49,7 @@ Usage:
   cpctl file push <path> [-server URL] [-ca PATH]
   cpctl file pull [destination] [-server URL] [-ca PATH]
   cpctl status [-server URL] [-ca PATH]
-  cpctl ca [-ca-url URL] [-out PATH] [-server URL] [-ca PATH]
+  cpctl ca [-ca-url URL] [-out PATH] [-fingerprint SHA256] [-server URL] [-ca PATH]
 
 The clipboard commands use the Wayland clipboard and need wl-clipboard
 (WAYLAND_DISPLAY must be set). -server defaults to $CP_SERVER and is required
@@ -75,7 +76,7 @@ func realMain() int {
 	case ctx.Err() != nil:
 		return 130
 	default:
-		fmt.Fprintf(os.Stderr, "cpctl: %v\n", err)
+		fmt.Fprintf(os.Stderr, "cpctl: %s\n", sanitize.Clean(err.Error()))
 		return 1
 	}
 }
@@ -227,7 +228,7 @@ func clipPull(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "Copied %s %s to the Wayland clipboard\n",
-		progress.HumanSize(int64(len(data))), contentType)
+		progress.HumanSize(int64(len(data))), sanitize.Clean(contentType))
 	return nil
 }
 
@@ -275,7 +276,7 @@ func filePush(ctx context.Context, args []string, stdout io.Writer) error {
 	if entry.Name != "" {
 		name = entry.Name
 	}
-	fmt.Fprintf(stdout, "Uploaded %s (%s)\n", name, progress.HumanSize(fi.Size()))
+	fmt.Fprintf(stdout, "Uploaded %s (%s)\n", sanitize.Clean(name), progress.HumanSize(fi.Size()))
 	return nil
 }
 
@@ -316,40 +317,43 @@ func filePull(ctx context.Context, args []string, stdout io.Writer) error {
 		return fmt.Errorf("create destination directory: %w", err)
 	}
 
-	part := dest + ".part"
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	part, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".part-*")
 	if err != nil {
-		return fmt.Errorf("create %s: %w", part, err)
+		return fmt.Errorf("create temporary download file in %s: %w", filepath.Dir(dest), err)
 	}
-	saved := false
+	partName := part.Name()
+	keep := false
 	defer func() {
-		if !saved {
-			f.Close()
-			os.Remove(part)
+		if !keep {
+			part.Close()
+			os.Remove(partName)
 		}
 	}()
 
 	bar := progress.New(name, st.File.Size)
 	defer bar.Done()
-	n, err := c.GetFile(ctx, io.MultiWriter(f, bar))
+	n, err := c.GetFile(ctx, io.MultiWriter(part, bar))
 	if err != nil {
 		if errors.Is(err, client.ErrEmpty) {
 			return errors.New("file registry is empty")
 		}
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := part.Chmod(0o644); err != nil {
+		return fmt.Errorf("set permissions on %s: %w", partName, err)
+	}
+	if err := part.Sync(); err != nil {
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err := part.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(part, dest); err != nil {
+	if err := os.Rename(partName, dest); err != nil {
 		return err
 	}
-	saved = true
+	keep = true
 	bar.Done()
-	fmt.Fprintf(stdout, "Saved %s (%s)\n", dest, progress.HumanSize(n))
+	fmt.Fprintf(stdout, "Saved %s (%s)\n", sanitize.Clean(dest), progress.HumanSize(n))
 	return nil
 }
 
@@ -382,6 +386,7 @@ func caCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("cpctl ca", flag.ContinueOnError)
 	caURL := fs.String("ca-url", "", "URL of the CA certificate; default http://<server-host>:8080/ca.crt")
 	out := fs.String("out", filepath.Join(userConfigDir(), "ca.crt"), "where to save the certificate")
+	expected := fs.String("fingerprint", "", "expected SHA-256 fingerprint; reject the download if it does not match")
 	server := fs.String("server", defaultServer(), "portal base URL, used to derive -ca-url")
 	fs.String("ca", defaultCAFile(), "portal CA certificate (not used by this command)")
 	pos, err := parseFlags(fs, args, stdout, usageCA)
@@ -406,29 +411,35 @@ func caCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	certs, err := parseCertificates(body)
+	bundle, err := parseCertificates(body)
 	if err != nil {
 		return err
 	}
-	var caCert *x509.Certificate
-	for _, cert := range certs {
-		if cert.IsCA {
-			caCert = cert
-			break
-		}
+	// A bundle with several certificates is how an active attacker smuggles a
+	// second root past a fingerprint check, so accept exactly one.
+	if len(bundle) != 1 {
+		return fmt.Errorf("downloaded file must contain exactly one certificate, found %d", len(bundle))
 	}
-	if caCert == nil {
+	caCert := bundle[0]
+	if !caCert.IsCA {
 		return errors.New("downloaded certificate is not a CA certificate")
 	}
-	if err := writeFileAtomic(*out, encodeCertificates(certs)); err != nil {
+	actual := certs.FormatFingerprint(caCert)
+	if want := normalizeFingerprint(*expected); want != "" {
+		if normalizeFingerprint(actual) != want {
+			return fmt.Errorf("downloaded CA fingerprint %s does not match expected %s; nothing was saved",
+				actual, sanitize.Clean(*expected))
+		}
+	}
+	if err := writeFileAtomic(*out, encodeCertificate(caCert)); err != nil {
 		return fmt.Errorf("save CA certificate: %w", err)
 	}
 
-	fmt.Fprintf(stdout, "SHA-256 fingerprint: %s\n", fingerprint(caCert))
-	fmt.Fprintf(stdout, "Saved %s\n", *out)
+	fmt.Fprintf(stdout, "SHA-256 fingerprint: %s\n", actual)
+	fmt.Fprintf(stdout, "Saved %s\n", sanitize.Clean(*out))
 	fmt.Fprintf(stdout, "\nTrust it on each device:\n\n")
-	fmt.Fprintf(stdout, "  Fedora:\n    sudo trust anchor --store %s\n\n", *out)
-	fmt.Fprintf(stdout, "  Debian/Ubuntu:\n    sudo cp %s /usr/local/share/ca-certificates/central-portal.crt\n    sudo update-ca-certificates\n\n", *out)
+	fmt.Fprintf(stdout, "  Fedora:\n    sudo trust anchor --store %s\n\n", sanitize.Clean(*out))
+	fmt.Fprintf(stdout, "  Debian/Ubuntu:\n    sudo cp %s /usr/local/share/ca-certificates/central-portal.crt\n    sudo update-ca-certificates\n\n", sanitize.Clean(*out))
 	fmt.Fprintf(stdout, "  Android:\n    Settings → Security → Install a certificate → CA certificate\n    (choose the downloaded ca.crt)\n\n")
 	fmt.Fprintf(stdout, "  iOS:\n    Install the profile, then enable full trust in\n    Settings → General → About → Certificate Trust Settings\n")
 	return nil
@@ -521,11 +532,11 @@ func describe(entry *model.Entry, withName bool) string {
 	}
 	parts := make([]string, 0, 4)
 	if withName && entry.Name != "" {
-		parts = append(parts, entry.Name)
+		parts = append(parts, sanitize.Clean(entry.Name))
 	}
 	// Images are worth naming; text is the default and stays short.
 	if strings.HasPrefix(entry.ContentType, "image/") {
-		parts = append(parts, entry.ContentType)
+		parts = append(parts, sanitize.Clean(entry.ContentType))
 	}
 	parts = append(parts, progress.HumanSize(entry.Size))
 	if !entry.UpdatedAt.IsZero() {
@@ -564,11 +575,13 @@ func isHelp(arg string) bool {
 }
 
 // defaultServer has no built-in address: deployments differ and a hardcoded
-// host would be wrong (and private) for everyone else.
+// tunnel IP is wrong for everyone else.
 func defaultServer() string {
 	return os.Getenv("CP_SERVER")
 }
 
+// newClient rejects a missing server before the client spends time on URL or
+// CA-file parsing.
 func newClient(server, ca string) (*client.Client, error) {
 	if strings.TrimSpace(server) == "" {
 		return nil, errors.New("no server configured: pass -server URL or set CP_SERVER")
@@ -610,6 +623,29 @@ func bootstrapCAURL(server string) (string, error) {
 
 const maxCABytes = 1 << 20
 
+// caHTTPClient downloads the bootstrap certificate with a deadline and refuses
+// redirects that would downgrade HTTPS or move to another host. The bootstrap
+// URL is not authenticated, so a redirect must not widen where it points.
+var caHTTPClient = &http.Client{
+	Timeout: 20 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		prev := via[len(via)-1].URL
+		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refuse redirect to unsupported scheme %q", req.URL.Scheme)
+		}
+		if prev.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refuse redirect from https to %s", req.URL.Scheme)
+		}
+		if !strings.EqualFold(prev.Host, req.URL.Host) {
+			return fmt.Errorf("refuse redirect from host %s to %s", prev.Host, req.URL.Host)
+		}
+		return nil
+	},
+}
+
 // fetchCA downloads the certificate over the bootstrap listener. Plain HTTP is
 // expected because nothing can be trusted before the CA is installed.
 func fetchCA(ctx context.Context, rawURL string) ([]byte, error) {
@@ -627,7 +663,7 @@ func fetchCA(ctx context.Context, rawURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := caHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download %s: %w", rawURL, err)
 	}
@@ -677,23 +713,16 @@ func parseCertificates(data []byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-func encodeCertificates(certs []*x509.Certificate) []byte {
-	var out []byte
-	for _, cert := range certs {
-		out = append(out, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})...)
-	}
-	return out
+func encodeCertificate(cert *x509.Certificate) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
 }
 
-// fingerprint returns the SHA-256 of the DER certificate as uppercase,
-// colon-separated hex.
-func fingerprint(cert *x509.Certificate) string {
-	sum := sha256.Sum256(cert.Raw)
-	parts := make([]string, len(sum))
-	for i, b := range sum {
-		parts[i] = fmt.Sprintf("%02X", b)
-	}
-	return strings.Join(parts, ":")
+// normalizeFingerprint makes fingerprint comparison tolerant of colons, spaces
+// and letter case, so users can paste either form they were shown.
+func normalizeFingerprint(fp string) string {
+	fp = strings.TrimSpace(fp)
+	fp = strings.NewReplacer(":", "", " ", "").Replace(fp)
+	return strings.ToUpper(fp)
 }
 
 func writeFileAtomic(path string, data []byte) error {
