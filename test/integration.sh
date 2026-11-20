@@ -116,13 +116,8 @@ assert_eq "$head_size" "0" "HEAD /api/status has an empty body"
 echo
 echo "== clipboard registry"
 printf 'hello portal\nsecond line' >"$tmp/clip.txt"
-"$tmp/cpctl" clip push -text - -server "$base" -ca "$tmp/ca.crt" <"$tmp/clip.txt" >"$tmp/out" 2>"$tmp/err"
-assert_contains "$(cat "$tmp/out")" "Uploaded clipboard" "CLI uploads the clipboard"
-grep -Eq 'B/s' "$tmp/err" || fail "CLI upload did not print progress on stderr"
-say "CLI upload prints progress"
-
+curl -fsS --cacert "$tmp/ca.crt" -X PUT -H 'Content-Type: text/plain; charset=utf-8' --data-binary @"$tmp/clip.txt" -o /dev/null "$base/api/clipboard"
 assert_eq "$(curl -fsS --cacert "$tmp/ca.crt" "$base/api/clipboard")" "$(cat "$tmp/clip.txt")" "clipboard bytes roundtrip through the API"
-assert_eq "$("$tmp/cpctl" clip pull -stdout -server "$base" -ca "$tmp/ca.crt" 2>/dev/null)" "$(cat "$tmp/clip.txt")" "CLI pulls the clipboard to stdout"
 assert_eq "$(curl -fsS --cacert "$tmp/ca.crt" "$base/api/status" | json_get clipboard.size)" "$(wc -c <"$tmp/clip.txt" | tr -d ' ')" "status reports the clipboard size"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$tmp/ca.crt" -X PUT -H 'Content-Type: text/plain; charset=utf-8' --data-binary '' "$base/api/clipboard")
@@ -145,8 +140,9 @@ headers=$(curl -sD - -o "$tmp/pixel.out" --cacert "$tmp/ca.crt" "$base/api/clipb
 assert_contains "$headers" "Content-Type: image/png" "image download keeps its media type"
 assert_eq "$(sha256sum "$tmp/pixel.out" | cut -d' ' -f1)" "$(sha256sum "$tmp/pixel.png" | cut -d' ' -f1)" "image bytes roundtrip through the API"
 
-"$tmp/cpctl" clip pull -stdout -server "$base" -ca "$tmp/ca.crt" >"$tmp/cli.png" 2>/dev/null
-assert_eq "$(sha256sum "$tmp/cli.png" | cut -d' ' -f1)" "$(sha256sum "$tmp/pixel.png" | cut -d' ' -f1)" "CLI downloads image bytes to stdout"
+events=$(curl -Ns --max-time 2 --cacert "$tmp/ca.crt" "$base/api/events" 2>/dev/null || true)
+assert_contains "$events" '"kind":"clipboard"' "event stream sends a clipboard snapshot"
+assert_contains "$events" '"contentType":"image/png"' "event snapshot carries the current entry"
 
 code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$tmp/ca.crt" -X PUT -H 'Content-Type: image/svg+xml' --data-binary '<svg xmlns="http://www.w3.org/2000/svg"/>' "$base/api/clipboard")
 assert_eq "$code" "415" "SVG clipboard upload is rejected"
@@ -277,17 +273,11 @@ if "$tmp/cpctl" status -server "$base" -ca "" >/dev/null 2>&1; then
 fi
 say "CLI refuses an untrusted certificate"
 
-if env -u WAYLAND_DISPLAY "$tmp/cpctl" clip pull -server "$base" -ca "$tmp/ca.crt" >/dev/null 2>"$tmp/wl.err"; then
-	fail "clip pull succeeded without a Wayland session"
+if env -u WAYLAND_DISPLAY "$tmp/cpctl" clip sync -server "$base" -ca "$tmp/ca.crt" >/dev/null 2>"$tmp/wl.err"; then
+	fail "clip sync succeeded without a Wayland session"
 fi
-grep -qi 'wayland' "$tmp/wl.err" || fail "clip pull failure does not mention Wayland"
-say "clip pull fails safely without Wayland"
-
-if env -u WAYLAND_DISPLAY "$tmp/cpctl" clip push -server "$base" -ca "$tmp/ca.crt" >/dev/null 2>"$tmp/wl.err"; then
-	fail "clip push succeeded without a Wayland session"
-fi
-grep -qi 'wayland' "$tmp/wl.err" || fail "clip push failure does not mention Wayland"
-say "clip push fails safely without Wayland"
+grep -qi 'wayland' "$tmp/wl.err" || fail "clip sync failure does not mention Wayland"
+say "clip sync fails safely without Wayland"
 
 echo
 echo "integration: ${pass} checks passed"

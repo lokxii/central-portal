@@ -5,6 +5,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -36,8 +38,19 @@ const (
 	// transfers are fine as long as they keep making progress.
 	idleTimeout = 30 * time.Second
 
+	// eventHeartbeat is shorter than idleTimeout so an idle event stream keeps
+	// its write deadline fresh and dead connections are noticed.
+	eventHeartbeat = 15 * time.Second
+
 	contentSecurityPolicy = "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'"
 )
+
+// event is one clipboard change broadcast on GET /api/events. A nil Entry is
+// the snapshot of an empty registry.
+type event struct {
+	Kind  string       `json:"kind"`
+	Entry *model.Entry `json:"entry"`
+}
 
 // ResolveListenAddr turns a configured listen address into a concrete one.
 //
@@ -72,6 +85,10 @@ type Config struct {
 	Logger       *slog.Logger
 	MaxClipboard int64
 	MaxFile      int64
+	// Shutdown is closed when the server stops. Event streams end so
+	// http.Server.Shutdown does not wait for long-lived connections; nil is
+	// fine for tests and for a handler that is never shut down.
+	Shutdown <-chan struct{}
 }
 
 // New returns the portal handler.
@@ -83,6 +100,8 @@ func New(cfg Config) http.Handler {
 		logger:       cfg.Logger,
 		maxClipboard: cfg.MaxClipboard,
 		maxFile:      cfg.MaxFile,
+		events:       newEventHub(),
+		shutdown:     cfg.Shutdown,
 	}
 	if h.logger == nil {
 		h.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -99,6 +118,7 @@ func New(cfg Config) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/status", h.getStatus)
+	mux.HandleFunc("GET /api/events", h.getEvents)
 	mux.HandleFunc("GET /api/clipboard", h.getClipboard)
 	mux.HandleFunc("PUT /api/clipboard", h.putClipboard)
 	mux.HandleFunc("GET /api/file", h.getFile)
@@ -116,6 +136,8 @@ type handler struct {
 	logger       *slog.Logger
 	maxClipboard int64
 	maxFile      int64
+	events       *eventHub
+	shutdown     <-chan struct{}
 }
 
 func (h *handler) getStatus(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +149,70 @@ func (h *handler) getStatus(w http.ResponseWriter, r *http.Request) {
 		status.File = &e
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// getEvents streams clipboard changes as server-sent events. The first event is
+// the current entry, which lets a reconnecting client reconcile immediately.
+func (h *handler) getEvents(w http.ResponseWriter, r *http.Request) {
+	ch, cancel := h.events.subscribe()
+	defer cancel()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return
+	}
+
+	entry, ok := h.store.Get(model.KindClipboard)
+	snapshot := event{Kind: model.KindClipboard}
+	if ok {
+		snapshot.Entry = &entry
+	}
+	if err := writeEvent(w, snapshot); err != nil {
+		return
+	}
+	if err := rc.Flush(); err != nil {
+		return
+	}
+
+	heartbeat := time.NewTicker(eventHeartbeat)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-h.shutdown:
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := writeEvent(w, ev); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func writeEvent(w io.Writer, ev event) error {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }
 
 func (h *handler) getClipboard(w http.ResponseWriter, r *http.Request) {
@@ -170,6 +256,7 @@ func (h *handler) putClipboard(w http.ResponseWriter, r *http.Request) {
 		h.uploadError(w, err)
 		return
 	}
+	h.events.publish(event{Kind: model.KindClipboard, Entry: &e})
 	writeJSON(w, http.StatusOK, e)
 }
 
@@ -393,6 +480,44 @@ func (n *nonEmptyReader) Read(p []byte) (int, error) {
 		return 0, errEmptyUpload
 	}
 	return 0, err
+}
+
+// eventHub fans clipboard updates out to connected event streams. A slow
+// subscriber loses updates instead of blocking an upload; it gets the current
+// entry again on reconnect, and the CLI also reconciles from /api/status.
+type eventHub struct {
+	mu   sync.Mutex
+	subs map[chan event]struct{}
+}
+
+func newEventHub() *eventHub {
+	return &eventHub{subs: make(map[chan event]struct{})}
+}
+
+func (h *eventHub) subscribe() (<-chan event, func()) {
+	ch := make(chan event, 8)
+	h.mu.Lock()
+	h.subs[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch, func() {
+		h.mu.Lock()
+		if _, ok := h.subs[ch]; ok {
+			delete(h.subs, ch)
+			close(ch)
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *eventHub) publish(ev event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }
 
 // withMiddleware adds security headers, default caching, per-operation I/O

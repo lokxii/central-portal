@@ -96,6 +96,9 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("open embedded frontend: %w", err)
 	}
 
+	// Closing this ends long-lived event streams before Shutdown waits for
+	// active connections.
+	shutdown := make(chan struct{})
 	portal := server.New(server.Config{
 		Store:        st,
 		Web:          webFS,
@@ -103,6 +106,7 @@ func run(logger *slog.Logger) error {
 		Logger:       logger,
 		MaxClipboard: *maxClipboard,
 		MaxFile:      *maxFile,
+		Shutdown:     shutdown,
 	})
 	httpsSrv := &http.Server{
 		Handler: portal,
@@ -176,6 +180,7 @@ func run(logger *slog.Logger) error {
 
 	select {
 	case err := <-errc:
+		close(shutdown)
 		shutdownServers(httpsSrv, httpSrv)
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
@@ -183,6 +188,7 @@ func run(logger *slog.Logger) error {
 		return err
 	case <-ctx.Done():
 		logger.Info("shutting down")
+		close(shutdown)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := httpsSrv.Shutdown(shutdownCtx); err != nil {

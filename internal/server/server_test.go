@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"central-portal/internal/model"
 	"central-portal/internal/store"
@@ -23,6 +26,10 @@ MIIBdGVzdA==
 `
 
 func newTestHandler(t *testing.T) http.Handler {
+	return newTestHandlerConfig(t, nil)
+}
+
+func newTestHandlerConfig(t *testing.T, mutate func(*Config)) http.Handler {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(dir)
@@ -39,14 +46,18 @@ func newTestHandler(t *testing.T) http.Handler {
 		"manifest.webmanifest": &fstest.MapFile{Data: []byte(`{"name":"Portal"}`)},
 		"icons/icon-192.png":   &fstest.MapFile{Data: []byte("png")},
 	}
-	return New(Config{
+	cfg := Config{
 		Store:        st,
 		Web:          web,
 		CACertPath:   caPath,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxClipboard: 16,
 		MaxFile:      16,
-	})
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	return New(cfg)
 }
 
 func do(t *testing.T, h http.Handler, method, target, body string, chunked bool) *httptest.ResponseRecorder {
@@ -107,6 +118,97 @@ func TestStatusEmpty(t *testing.T) {
 	status := getStatus(t, h)
 	if status.Clipboard != nil || status.File != nil {
 		t.Errorf("empty status = %+v, want nil entries", status)
+	}
+}
+
+func TestEventsSnapshotAndBroadcast(t *testing.T) {
+	h := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+	next := func() event {
+		t.Helper()
+		for sc.Scan() {
+			line := sc.Text()
+			if value, ok := strings.CutPrefix(line, "data: "); ok {
+				var ev event
+				if err := json.Unmarshal([]byte(value), &ev); err != nil {
+					t.Fatalf("decode event %q: %v", value, err)
+				}
+				return ev
+			}
+		}
+		t.Fatalf("event stream ended: %v", sc.Err())
+		return event{}
+	}
+
+	snapshot := next()
+	if snapshot.Kind != model.KindClipboard || snapshot.Entry != nil {
+		t.Fatalf("snapshot = %+v, want an empty clipboard entry", snapshot)
+	}
+
+	if rec := do(t, h, "PUT", "/api/clipboard", "hello", false); rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/clipboard = %d, want 200", rec.Code)
+	}
+	update := next()
+	if update.Kind != model.KindClipboard || update.Entry == nil {
+		t.Fatalf("update = %+v, want a clipboard entry", update)
+	}
+	if update.Entry.Size != 5 || len(update.Entry.SHA256) != 64 {
+		t.Errorf("update entry = %+v", update.Entry)
+	}
+}
+
+func TestEventsStreamStopsOnShutdown(t *testing.T) {
+	done := make(chan struct{})
+	h := newTestHandlerConfig(t, func(cfg *Config) { cfg.Shutdown = done })
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open event stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Wait until the handler has subscribed and sent its snapshot.
+	buf := make([]byte, 1)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+
+	close(done)
+	closed := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, resp.Body)
+		closed <- err
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event stream did not stop after shutdown")
 	}
 }
 
@@ -436,6 +538,7 @@ func TestWrongMethod(t *testing.T) {
 	h := newTestHandler(t)
 	for _, tc := range []struct{ method, target string }{
 		{"POST", "/api/status"},
+		{"POST", "/api/events"},
 		{"DELETE", "/api/clipboard"},
 		{"POST", "/api/file"},
 	} {

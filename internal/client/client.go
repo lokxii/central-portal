@@ -6,6 +6,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -141,6 +142,76 @@ func (c *Client) Status(ctx context.Context) (model.Status, error) {
 		return st, fmt.Errorf("decode status: %w", err)
 	}
 	return st, nil
+}
+
+// Event is one server-sent change notification from GET /api/events. Entry is
+// nil when the clipboard registry is empty, which is also the snapshot sent to
+// a new subscriber.
+type Event struct {
+	Kind  string       `json:"kind"`
+	Entry *model.Entry `json:"entry"`
+}
+
+// maxEventBytes bounds one server-sent event. Entry metadata is far smaller;
+// the limit only stops a broken server from growing a line without bound.
+const maxEventBytes = 64 << 10
+
+// StreamEvents reads GET /api/events and calls handle for every update until
+// ctx is cancelled, the connection fails, or handle returns an error. The
+// server sends the current clipboard entry as the first event, so a caller can
+// reconnect and reconcile without a separate status request.
+func (c *Client) StreamEvents(ctx context.Context, handle func(Event) error) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/events", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return networkError(err)
+	}
+	defer resp.Body.Close()
+	if err := responseError(resp); err != nil {
+		return err
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/event-stream") {
+		return fmt.Errorf("event stream has content type %q, want text/event-stream", got)
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 4096), maxEventBytes)
+	var data strings.Builder
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			if data.Len() == 0 {
+				continue
+			}
+			var ev Event
+			if err := json.Unmarshal([]byte(strings.TrimSuffix(data.String(), "\n")), &ev); err != nil {
+				return fmt.Errorf("decode event: %w", err)
+			}
+			data.Reset()
+			if err := handle(ev); err != nil {
+				return err
+			}
+			continue
+		}
+		// A colon starts a comment, which the server uses as a heartbeat.
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		value, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		data.WriteString(strings.TrimPrefix(value, " "))
+		data.WriteByte('\n')
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return errors.New("event stream closed")
 }
 
 // GetClipboard downloads the clipboard registry. The raw body is copied to w

@@ -129,8 +129,7 @@ should print `aarch64` on both). Then put it on `PATH`.
 export CP_SERVER=https://<portal-ip>:8443
 cpctl ca                               # fetch CA + print trust instructions
 cpctl ca -fingerprint AA:BB:…          # optional: pin the printed fingerprint
-cpctl clip push                        # Wayland clipboard (text or image) -> registry
-cpctl clip pull                        # registry -> Wayland clipboard
+cpctl clip sync                        # keep Wayland clipboard and registry in sync
 cpctl file push ./report.pdf           # file -> registry
 cpctl file pull                        # registry -> ~/Downloads/report.pdf
 cpctl file pull ~/Documents            # or a specific directory/file
@@ -141,8 +140,17 @@ Every command accepts `-server URL` and `-ca PATH`, or the `CP_SERVER` and
 `CP_CA` environment variables. There is no built-in server address: set
 `CP_SERVER` or pass `-server`. The CA defaults to
 `~/.config/central-portal/ca.crt` when present, otherwise the system roots.
-Transfers print a progress bar on stderr; `clip pull -stdout` keeps stdout clean
-for piping.
+File transfers print a progress bar on stderr.
+
+`cpctl clip sync` is the clipboard workflow: leave it running in the background
+and it uploads every local clipboard change (text or image) and writes server
+changes back to the Wayland clipboard. It ignores its own echo by comparing
+SHA-256 hashes. On startup, a non-empty server registry wins; an empty registry
+adopts the local clipboard. Use `-once` to reconcile once and exit, `-interval`
+to change how often the local clipboard is checked (default 1s), and
+`-reconcile` to change the `/api/status` fallback interval (default 30s). If the
+server has not been updated for `/api/events`, the fallback still syncs remote
+changes, just with up to 30 seconds of delay.
 
 `cpctl ca` downloads from `http://<server-host>:8080/ca.crt` unless `-ca-url`
 is given, verifies that the result is a CA certificate, and prints its SHA-256
@@ -159,6 +167,32 @@ Clipboard operations are Wayland-only and fail safely: on a machine without
 `WAYLAND_DISPLAY` (including a headless host) or without `wl-clipboard`, the CLI
 errors before touching the network or any clipboard. Install `wl-clipboard`
 (`sudo dnf install wl-clipboard` on Fedora).
+
+## Run clipboard sync as a user service
+
+`deploy/cpctl-clip-sync.service` is a systemd **user** unit for the laptop. It
+reads the portal URL and the Wayland display from
+`~/.config/central-portal/sync.env`:
+
+```sh
+install -d -m 0700 ~/.config/central-portal
+cat >~/.config/central-portal/sync.env <<EOF
+CP_SERVER=https://<portal-ip>:8443
+WAYLAND_DISPLAY=$WAYLAND_DISPLAY
+EOF
+chmod 600 ~/.config/central-portal/sync.env
+
+sudo install -m 0755 bin/cpctl /usr/local/bin/cpctl
+install -d ~/.config/systemd/user
+cp deploy/cpctl-clip-sync.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cpctl-clip-sync
+journalctl --user -u cpctl-clip-sync -f
+```
+
+The unit restarts on failure, so it also survives a compositor restart once the
+Wayland socket is back. `CP_CA` can be added to `sync.env` if the CA is not in
+the default location.
 
 ## Deploy as a service
 
@@ -220,9 +254,10 @@ created.
   server certificates valid for more than 825 days (including private CAs), so
   the server issues 824-day leaves and renews them automatically 30 days before
   expiry.
-- **Clipboard commands fail** — expected on the host and on any non-Wayland
-  session. Use `-text` / `-stdout` for testing, or a Wayland desktop for the
-  real clipboard.
+- **`clip sync` fails** — expected on the server host and on any non-Wayland
+  session. Run it on a Wayland desktop with `wl-clipboard` installed; on a
+  headless host use the file commands and the web UI instead. `clip sync -once`
+  shows the same Wayland error without starting the loop.
 - **413 upload rejected** — raise `-max-file-bytes` or `-max-clipboard-bytes`.
 - **415 unsupported clipboard media type** — the clipboard accepts text or a
   raster image (PNG/JPEG/WebP/GIF) only; markup types such as SVG are refused

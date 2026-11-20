@@ -33,8 +33,6 @@ var (
 )
 
 const (
-	usageClipPush = "usage: cpctl clip push [-text <text>|-] [-server URL] [-ca PATH]\n"
-	usageClipPull = "usage: cpctl clip pull [-stdout] [-server URL] [-ca PATH]\n"
 	usageFilePush = "usage: cpctl file push <path> [-server URL] [-ca PATH]\n"
 	usageFilePull = "usage: cpctl file pull [destination] [-server URL] [-ca PATH]\n"
 	usageStatus   = "usage: cpctl status [-server URL] [-ca PATH]\n"
@@ -44,18 +42,19 @@ const (
 var usageText = `cpctl is the command line client for the central portal.
 
 Usage:
-  cpctl clip push [-text <text>|-] [-server URL] [-ca PATH]
-  cpctl clip pull [-stdout] [-server URL] [-ca PATH]
+  cpctl clip sync [-interval DURATION] [-reconcile DURATION] [-once] [-server URL] [-ca PATH]
   cpctl file push <path> [-server URL] [-ca PATH]
   cpctl file pull [destination] [-server URL] [-ca PATH]
   cpctl status [-server URL] [-ca PATH]
   cpctl ca [-ca-url URL] [-out PATH] [-fingerprint SHA256] [-server URL] [-ca PATH]
 
-The clipboard commands use the Wayland clipboard and need wl-clipboard
-(WAYLAND_DISPLAY must be set). -server defaults to $CP_SERVER and is required
-when that variable is unset. -ca defaults to $CP_CA or
-~/.config/central-portal/ca.crt when that file exists, and otherwise to the
-system roots.
+cpctl clip sync keeps the Wayland clipboard and the portal registry in step in
+both directions. It needs wl-clipboard and a Wayland session (WAYLAND_DISPLAY
+must be set), and runs until interrupted; -once reconciles a single time.
+
+-server defaults to $CP_SERVER and is required when that variable is unset. -ca
+defaults to $CP_CA or ~/.config/central-portal/ca.crt when that file exists,
+and otherwise to the system roots.
 `
 
 func main() {
@@ -108,10 +107,8 @@ func runClip(ctx context.Context, args []string, stdout io.Writer) error {
 		return errUsage
 	}
 	switch args[0] {
-	case "push":
-		return clipPush(ctx, args[1:], stdout)
-	case "pull":
-		return clipPull(ctx, args[1:], stdout)
+	case "sync":
+		return clipSync(ctx, args[1:], stdout)
 	}
 	if isHelp(args[0]) {
 		io.WriteString(stdout, usageText)
@@ -135,101 +132,6 @@ func runFile(ctx context.Context, args []string, stdout io.Writer) error {
 		return errHelp
 	}
 	return errUsage
-}
-
-func clipPush(ctx context.Context, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("cpctl clip push", flag.ContinueOnError)
-	text := fs.String("text", "", `text to upload; "-" reads standard input`)
-	server := fs.String("server", defaultServer(), "portal base URL")
-	ca := fs.String("ca", defaultCAFile(), "portal CA certificate; empty uses system roots")
-	pos, err := parseFlags(fs, args, stdout, usageClipPush)
-	if err != nil {
-		return err
-	}
-	if len(pos) != 0 {
-		return errUsage
-	}
-
-	var data []byte
-	contentType := model.ContentTypeText
-	switch {
-	case flagWasSet(fs, "text") && *text == "-":
-		data, err = readStdin(ctx)
-	case flagWasSet(fs, "text"):
-		data = []byte(*text)
-	default:
-		data, contentType, err = readWaylandClipboard(ctx)
-	}
-	if err != nil {
-		return err
-	}
-	if len(data) == 0 {
-		return errors.New("empty content: nothing to upload")
-	}
-
-	c, err := newClient(*server, *ca)
-	if err != nil {
-		return err
-	}
-	bar := progress.New("clipboard", int64(len(data)))
-	defer bar.Done()
-	if _, err := c.PutClipboard(ctx, data, contentType, bar); err != nil {
-		return err
-	}
-	bar.Done()
-	fmt.Fprintf(stdout, "Uploaded clipboard (%s)\n", progress.HumanSize(int64(len(data))))
-	return nil
-}
-
-func clipPull(ctx context.Context, args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("cpctl clip pull", flag.ContinueOnError)
-	toStdout := fs.Bool("stdout", false, "write the clipboard bytes to standard output")
-	server := fs.String("server", defaultServer(), "portal base URL")
-	ca := fs.String("ca", defaultCAFile(), "portal CA certificate; empty uses system roots")
-	pos, err := parseFlags(fs, args, stdout, usageClipPull)
-	if err != nil {
-		return err
-	}
-	if len(pos) != 0 {
-		return errUsage
-	}
-
-	// Fail before any transfer when the clipboard cannot be written.
-	if !*toStdout {
-		if err := requireWayland("wl-copy"); err != nil {
-			return err
-		}
-	}
-
-	c, err := newClient(*server, *ca)
-	if err != nil {
-		return err
-	}
-	var total int64
-	if st, statusErr := c.Status(ctx); statusErr == nil && st.Clipboard != nil {
-		total = st.Clipboard.Size
-	}
-	bar := progress.New("clipboard", total)
-	defer bar.Done()
-	data, contentType, err := c.GetClipboard(ctx, bar)
-	if err != nil {
-		if errors.Is(err, client.ErrEmpty) {
-			return errors.New("clipboard registry is empty")
-		}
-		return err
-	}
-	bar.Done()
-
-	if *toStdout {
-		_, err := stdout.Write(data)
-		return err
-	}
-	if err := writeWaylandClipboard(ctx, data, contentType); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "Copied %s %s to the Wayland clipboard\n",
-		progress.HumanSize(int64(len(data))), sanitize.Clean(contentType))
-	return nil
 }
 
 func filePush(ctx context.Context, args []string, stdout io.Writer) error {
@@ -469,31 +371,6 @@ func parseFlags(fs *flag.FlagSet, args []string, stdout io.Writer, usage string)
 	}
 }
 
-func readStdin(ctx context.Context) ([]byte, error) {
-	const limit = 16 << 20
-	type result struct {
-		data []byte
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		data, err := io.ReadAll(io.LimitReader(os.Stdin, limit+1))
-		done <- result{data, err}
-	}()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-done:
-		if r.err != nil {
-			return nil, fmt.Errorf("read standard input: %w", r.err)
-		}
-		if len(r.data) > limit {
-			return nil, fmt.Errorf("standard input is larger than %d MiB", limit>>20)
-		}
-		return r.data, nil
-	}
-}
-
 // resolveDestination turns the optional command argument into a file path.
 // A missing destination means ~/Downloads; a directory or trailing slash means
 // "join the server's file name".
@@ -558,16 +435,6 @@ func relTime(t time.Time) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	}
 	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-}
-
-func flagWasSet(fs *flag.FlagSet, name string) bool {
-	found := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == name {
-			found = true
-		}
-	})
-	return found
 }
 
 func isHelp(arg string) bool {

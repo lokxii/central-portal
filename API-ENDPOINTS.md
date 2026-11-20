@@ -14,7 +14,8 @@ CLI) are built against this document.
 ## Conventions
 
 - Control endpoints return UTF-8 JSON. Payload endpoints (`/api/clipboard`,
-  `/api/file`) return raw bytes.
+  `/api/file`) return raw bytes. `GET /api/events` is a long-lived
+  `text/event-stream`.
 - API responses carry `Cache-Control: no-store`, including error responses
   (`404`, `405`, `413`, and so on). The bootstrap listener sets it on
   `/ca.crt` as well; static PWA assets use `no-cache` instead (see below).
@@ -81,6 +82,31 @@ Returns metadata for both registries. This is the cheap polling endpoint.
   "file": null
 }
 ```
+
+### `GET /api/events`
+
+Streams clipboard registry changes as small server-sent events over a
+long-lived `text/event-stream` response.
+
+- **200** — the stream stays open until the client disconnects or the server
+  stops.
+- The first event is the current entry, or `null` when the clipboard registry
+  is empty. A client can therefore reconnect without a separate status request.
+- Every successful `PUT /api/clipboard` then produces another event carrying
+  the new `Entry`.
+- Each `data:` line is one JSON object:
+
+```json
+{ "kind": "clipboard", "entry": { "size": 42, "sha256": "…", "contentType": "text/plain; charset=utf-8", "updatedAt": "2026-11-18T09:12:33.123456789Z" } }
+```
+
+- An empty registry snapshot is `{ "kind": "clipboard", "entry": null }`.
+- Comment lines (`: keep-alive`) are sent every 15 seconds and must be ignored.
+- No event history is kept and there is no `Last-Event-ID` replay. Reconnect,
+  use the snapshot, and reconcile against `/api/status` periodically.
+- Slow consumers may miss an update; the next event or a reconnect repairs the
+  state. Events are advisory, not a durable log.
+- Only clipboard changes are streamed; file registry changes are not.
 
 ### `GET /api/clipboard`
 
@@ -253,8 +279,17 @@ Only two routes exist, because HTTPS cannot be used before the CA is trusted:
   then rename on success; delete the temporary file on failure. Default
   destination is `~/Downloads`, keeping the server-provided basename. Refuse a
   file download larger than 1 GiB rather than filling the local disk.
+- **Sync:** `cpctl clip sync` watches the Wayland clipboard and streams
+  `/api/events`, writing remote changes locally and uploading local changes.
+  It sends the entry's `sha256` back on upload and ignores an event whose hash
+  matches the clipboard it just wrote, so one device does not echo its own
+  change. On startup the server entry wins when the registry is non-empty; an
+  empty registry adopts the local clipboard. Reconnect with backoff, re-read the
+  snapshot, and reconcile with `/api/status` periodically in case an event was
+  missed.
 - **Polling:** `/api/status` is safe to poll; the browser app does so every
-  10 seconds while visible.
+  10 seconds while visible. The CLI also reconciles every 30 seconds by default
+  as a fallback to the event stream.
 
 ## Server configuration
 
@@ -276,18 +311,21 @@ from a corrupt CA.
 ## CLI surface (consumer of this API)
 
 ```text
-cpctl clip push [-text <text>|-]   # Wayland clipboard (text or image, or -text/stdin) -> registry
-cpctl clip pull [-stdout]          # registry -> Wayland clipboard (text or image, or stdout)
+cpctl clip sync [-interval <duration>] [-reconcile <duration>] [-once]
+                                   # keep Wayland clipboard and registry in step
 cpctl file push <path>             # file -> registry
 cpctl file pull [destination]      # registry -> destination (default ~/Downloads)
 cpctl status                       # print both registry entries
 cpctl ca [-ca-url <url>] [-out <path>] [-fingerprint <AA:BB:…>]
 ```
 
-`clip push` picks the best available Wayland type (image before text) and sends
-its MIME type; `-text` always uploads text. `clip pull` writes the stored type
-back to Wayland and prints `Copied <size> <contentType> to the Wayland
-clipboard`; `-stdout` writes the raw bytes without adding a newline.
+`clip sync` runs until interrupted. It polls the local clipboard every second
+(`-interval`), receives server changes over `/api/events`, and reconciles with
+`/api/status` every 30 seconds (`-reconcile`) in case an event was missed. It
+picks the best available Wayland type (image before text) when uploading and
+writes the stored type back when downloading. `-once` performs one
+reconciliation and exits; on an empty registry it uploads the local clipboard,
+and otherwise it downloads the server entry.
 
 `cpctl ca` fetches over plain HTTP, defaulting to
 `http://<server-host>:8080/ca.crt` unless `-ca-url` is supplied. It saves only

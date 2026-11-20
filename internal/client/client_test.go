@@ -66,6 +66,60 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestStreamEvents(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/events" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		io.WriteString(w, `data: {"kind":"clipboard","entry":{"size":5,"sha256":"ab","contentType":"text/plain; charset=utf-8","updatedAt":"2026-11-18T09:12:33Z"}}`+"\n\n")
+		flusher.Flush()
+		io.WriteString(w, ": keep-alive\n\n")
+		flusher.Flush()
+		io.WriteString(w, `data: {"kind":"clipboard","entry":null}`+"\n\n")
+		flusher.Flush()
+	})
+	c, _ := testClient(t, h)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var events []Event
+	// The error after cancellation is irrelevant once both events arrived.
+	_ = c.StreamEvents(ctx, func(ev Event) error {
+		events = append(events, ev)
+		if len(events) == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if len(events) != 2 {
+		t.Fatalf("received %d events, want 2", len(events))
+	}
+	if events[0].Kind != model.KindClipboard || events[0].Entry == nil {
+		t.Fatalf("first event = %+v, want a clipboard entry", events[0])
+	}
+	if events[0].Entry.Size != 5 || events[0].Entry.SHA256 != "ab" {
+		t.Errorf("entry = %+v", events[0].Entry)
+	}
+	if events[1].Entry != nil {
+		t.Errorf("second event entry = %+v, want nil", events[1].Entry)
+	}
+}
+
+func TestStreamEventsRejectsWrongContentType(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, "{}")
+	})
+	c, _ := testClient(t, h)
+	err := c.StreamEvents(context.Background(), func(Event) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "text/event-stream") {
+		t.Fatalf("StreamEvents error = %v, want a content-type error", err)
+	}
+}
+
 func TestClipboardRoundtrip(t *testing.T) {
 	var stored []byte
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
